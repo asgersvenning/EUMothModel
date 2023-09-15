@@ -1,8 +1,8 @@
 from subprocess import run, PIPE, Popen
-from utils.config import get_config, deparse_args
+from utils.config import get_mount_config, deparse_args
 import atexit, os
 
-config = get_config()
+config = get_mount_config()
 remote, remote_subdir, local = config['remote'], config['remote_subdir'], config['local']
 
 def mount(remote_directory = remote, remote_subdirectory = remote_subdir, local_directory = local):

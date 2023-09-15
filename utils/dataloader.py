@@ -29,9 +29,5 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 # TODO: add configs for image size, batch size, etc.
-# config = get_config()['pretraining']
+# config = get_dataloader_config()
 
-transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])

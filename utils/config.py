@@ -14,6 +14,19 @@ def get_config():
     
     return config_data
 
+config = get_config()
+
+def get_this_config(this):
+    if this not in config:
+        raise ValueError("Key {} not found in config".format(this))
+    return config[this]
+
+def get_mount_config():
+    return config['mount']
+
+def get_dataloader_config():
+    return config['dataloader']
+
 def deparse_args(config, what):
     if not isinstance(what, str):
         raise TypeError("Expected string, got {}".format(type(what)))
