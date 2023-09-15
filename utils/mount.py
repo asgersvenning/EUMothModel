@@ -5,7 +5,14 @@ import atexit, os
 config = get_mount_config()
 remote, remote_subdir, local = config['remote'], config['remote_subdir'], config['local']
 
-def mount(remote_directory = remote, remote_subdirectory = remote_subdir, local_directory = local):
+def mount(remote_directory = remote, remote_subdirectory = remote_subdir, local_directory = local, force_remount = False):
+    # Check if remote directory is mounted
+    is_mounted = run(f'mountpoint -q {local_directory}', shell=True, stdout=PIPE, stderr=PIPE).returncode == 0
+    if is_mounted and not force_remount:
+        print("Remote directory is already mounted")
+        return True
+    elif is_mounted and force_remount:
+        unmount(local_directory)
     # Create local directory for remote mount
     mkdir_result = run(f'mkdir -p {local_directory}', shell=True, stdout=PIPE, stderr=PIPE)
     # Check if directory was created
