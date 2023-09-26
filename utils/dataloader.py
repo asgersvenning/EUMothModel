@@ -22,7 +22,7 @@
 # The classes are the species in the dataset.
 # The class labels are the indices of the species, sorted alphabetically, in the dataset.
 
-import os
+import os, re
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.io import read_image
@@ -33,25 +33,49 @@ config = c.get_dataloader_config()
 root_dir = c.get_mount_config()['local']
 
 # All images have a unique id, which is used in their naming scheme: UUID.jpg/jpeg
-class PretrainingImages():
-    def __init__(self, root_dir):
-        self.root_dir = root_dir
+class PretrainingImages:
+    def __init__(self, dir, index = True, n_max = -1):
+        self.dir = dir
         self.images = []
         self.family = []
         self.genus = []
         self.species = []
         self.uuids = []
 
-        for family in os.listdir(root_dir):
-            for genus in os.listdir(os.path.join(root_dir, family)):
-                for species in os.listdir(os.path.join(root_dir, family, genus)):
-                    for image in os.listdir(os.path.join(root_dir, family, genus, species)):
-                        uuid = image.split('.')[0]
-                        self.family.append(family)
-                        self.genus.append(genus)
-                        self.species.append(species)
-                        self.uuids.append(uuid)
-                        self.images.append(os.path.join(root_dir, family, genus, species, image))
+        if index:
+            index_file = f'{self.dir}{os.sep}folder_index.txt'
+            if not os.path.exists(index_file):
+                raise ValueError(f'Index file {index_file} does not exist')
+            with open(index_file, "r") as index:
+                for line_i, path in enumerate(index.readlines()):
+                    if n_max != -1 and line_i >= n_max:
+                        break
+                    path = path.rstrip('\n')
+                    file_ext = re.findall("\\.\w{2,4}$", path)
+                    if not file_ext or len(file_ext) > 1:
+                        print(f'No or invalid file extension found for {path}')
+                        continue
+                    file_ext = file_ext[0]
+                    self.images += [path]
+                    parts = re.findall(f'(?<={re.escape(self.dir)}{os.sep}).+', path)[0]
+                    family, genus, species, uuid = parts.split(os.sep)
+                    uuid = uuid.rstrip(file_ext)
+                    self.family += [family]
+                    self.genus += [genus]
+                    self.species += [species]
+                    self.uuids += [uuid]
+        else:
+            assert NotImplementedError("Indexing not implemented yet")
+        # for family in os.listdir(root_dir):
+        #     for genus in os.listdir(os.path.join(root_dir, family)):
+        #         for species in os.listdir(os.path.join(root_dir, family, genus)):
+        #             for image in os.listdir(os.path.join(root_dir, family, genus, species)):
+        #                 uuid = image.split('.')[0]
+        #                 self.family.append(family)
+        #                 self.genus.append(genus)
+        #                 self.species.append(species)
+        #                 self.uuids.append(uuid)
+        #                 self.images.append(os.path.join(root_dir, family, genus, species, image))
 
     def __len__(self):
         return len(self.uuids)
@@ -66,10 +90,11 @@ class PretrainingImages():
 
 
 class PretrainingDataset(Dataset):
-    def __init___(self, root_dir=root_dir, transform=None):
-        self.root_dir = root_dir
+    def __init__(self, dir=root_dir, n_max=-1, transform=None):
+        super().__init__()
+        self.dir = dir
         self.transform = transform
-        self.images = PretrainingImages(root_dir)
+        self.images = PretrainingImages(dir=self.dir, n_max=n_max)
         self.classes = sorted(list(set(self.images.species)))
         self.class_labels = {self.classes[i] : i for i in range(len(self.classes))}
         self.label2class = {i : self.classes[i] for i in range(len(self.classes))}
