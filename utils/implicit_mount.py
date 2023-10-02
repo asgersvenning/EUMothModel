@@ -216,8 +216,6 @@ class ImplicitMount:
         if self.verbose:
             print("Waiting for connection...")
         # Check if we are connected to the remote directory by executing the pwd command on the lftp shell
-        # If we are connected, the output of the pwd command will be the path of the remote directory
-        # If we are not connected, the output of the pwd command will be empty. Then we raise an error and terminate the lftp shell
         connected_path = self.pwd()
         print(f"Connected to {connected_path}")
         if not connected_path:
@@ -269,6 +267,22 @@ class ImplicitMount:
             path = path[2:]
         elif path == ".":
             path = ""
+        
+        # This function is used to sanitize the output of the lftp shell
+        # It is quite inefficient, but it is only used for the ls command, which is not performance critical?
+        # Folder index files should be used instead of ls in most cases, 
+        # but this function is still useful for debugging and for creating the folder index files
+        def sanitize_path(list, path) -> None:
+            if not path:
+                return
+            if isinstance(path, str):
+                path = [path]
+            for p in path:
+                if p.startswith("."):
+                    p = p[2:]
+                if not "folder_index.txt" in p:
+                    list += [p]
+        
         # Recursive ls is implemented by using the "cls" command, which returns a list of permissions and paths
         # and then recursively calling ls on each of the paths that are directories, 
         # which is determined by checking if the permission starts with "d"
@@ -285,22 +299,27 @@ class ImplicitMount:
                 if perm.startswith("d"):
                     output += self.ls(path, recursive=True)
                 else:
-                    if path.startswith("."):
-                        path = path[2:]
-                    output += [path]
+                    sanitize_path(output, path)
             return output
+        # Non-recursive case
         else:
             output = self.execute_command(f"cls {path} -1")
-        if path.startswith("."):
-            if isinstance(output, list):
-                return [i[2:] for i in output]
-            else:
-                return output[2:]
+
+        # Sanitize output and return	        
+        sanitize_path([], output)
+        if not isinstance(output, list):
+            TypeError("Expected list, got {}".format(type(output)))
+        
+        # Return cases (empty => None, single element => str, multiple elements => list)
+        if len(output) == 0:
+            return None
+        elif len(output) == 1:
+            return output[0]
         else:
             return output
     
     def lls(self, local_path: str, **kwargs):
-        # TODO: 
+        # TODO: Make the recursive option more user friendly and type safe:
         # currently the value of the "R" or "recursive" argument is ignored, 
         # the recursive version is always used if either of these arguments are specified
         # (and the non-recursive version is always used if neither of these arguments are specified)
@@ -489,10 +508,6 @@ class IOHandler(ImplicitMount):
         self.last_download = None
         self.last_type = None
         self.cache = {}
-        self.pool = None
-        if n_threads and n_threads > 1: # There are some lines here and there that make it seem like multi-threaded operation is supported, but it is not. This is a TODO.
-            raise NotImplementedError("Multi-threaded operation is not implemented yet.")
-        self.n_threads = n_threads if n_threads else 1
 
     def iter(self, remote_path: Union[str, List[str]]) -> "RemotePathIterator":
         iter_temp_dir = tempfile.TemporaryDirectory()
@@ -501,19 +516,10 @@ class IOHandler(ImplicitMount):
     def __enter__(self) -> "IOHandler":
         self.mount()
         self.lcd(self.local_dir)
-        # Check if the number of threads is valid
-        if not isinstance(self.n_threads, int) or self.n_threads < 0:
-            raise TypeError("Expected a positive int, got {} ({})".format(self.n_threads, type(self.n_threads)))
 
-        if self.n_threads > cpu_count():
-            warnings.warn(f"Number of threads {self.n_threads} is greater than number of CPUs {cpu_count()}. Using {cpu_count()} threads instead.")
-            self.n_threads = cpu_count()
-
-        # Create pool
-        if self.n_threads > 1:
-            self.pool = Pool(self.n_threads)
-
-        # Messages
+        # Print local directory:
+        # if the local directory is not specified in the config, 
+        # it is a temporary directory, so it is nice to know where it is located
         print(f"Local directory: {self.lpwd()}")
 
         # Return self
@@ -539,6 +545,8 @@ class IOHandler(ImplicitMount):
         self.__exit__()
 
     def download(self, remote_path: Union[str, List[str]], local_destination: Union[str, List[str], None]=None, blocking: bool=True, **kwargs) -> Union[str, List[str]]:
+        # If multiple remote paths are specified, use multi_download instead of download, 
+        # this function is more flexible than mirror (works for files from different directories) and much faster than executing multiple pget commands
         if not isinstance(remote_path, str) and len(remote_path) > 1:
             return self.multi_download(remote_path, local_destination, **kwargs)
         
@@ -548,15 +556,14 @@ class IOHandler(ImplicitMount):
         # Check if remote and local have file extensions:
         # The function assumes files have extensions and directories do not.
         remote_has_ext, local_has_ext = os.path.splitext(remote_path)[1] != "", os.path.splitext(local_destination)[1] != ""
-
         # If both remote and local have file extensions, the local destination should be a file path.
         if remote_has_ext and local_has_ext and os.path.isdir(local_destination):
             raise ValueError("Destination must be a file path if both remote and local have file extensions.")
-
         # If the remote does not have a file extension, the local destination should be a directory.
         if not remote_has_ext and not os.path.isdir(local_destination):
             raise ValueError("Destination must be a directory if remote does not have a file extension.")
         
+        # Download cases;
         # If the remote is a single file, use pget.
         if remote_has_ext:
             local_result = self.pget(remote_path, local_destination, blocking, **kwargs)
@@ -571,12 +578,15 @@ class IOHandler(ImplicitMount):
             local_result = self.mirror(remote_path, local_destination, blocking, **kwargs)
             self.last_type = "directory"
         
-        # TODO: Check local_result == local_destination
+        # TODO: Check local_result == local_destination (if it can be done in a relatively efficient way)
 
+        # Store the last download for later use (nice for debugging)
         self.last_download = local_result
+        # Return the local path of the downloaded file or directory
         return local_result
     
     def multi_download(self, remote_paths: List[str], local_destination: Union[str, List[str]], blocking: bool=True, n: int=5, **kwargs) -> List[str]:
+        # Type checking and default argument configuration
         if not isinstance(remote_paths, list):
             raise TypeError("Expected list, got {}".format(type(remote_paths)))
         if not (isinstance(local_destination, str) or isinstance(local_destination, list) or local_destination is None):
@@ -591,30 +601,23 @@ class IOHandler(ImplicitMount):
         if any([os.path.splitext(l)[1] != os.path.splitext(r)[1] for l, r in zip(local_destination, remote_paths)]):
             raise ValueError("Local and remote file extensions must match.")
         
-        ### Legacy code: 
-        ### Previously, this was done by queueing pget commands and then executing them in a single thread.
-        #
-        # single_commands = []
-        # for r, l in zip(remote_paths, local_destination):
-        #     single_commands += [self.pget(r, l, blocking=True, output=False, execute=False, **kwargs)]
-        # multi_command = "(" + " & ".join(single_commands) + ")"
-        #
-        # Download the files in parallel using a single mget command 
-        # (this is much faster than using many pget commands)
-        # 
-        
+        # Assemble the mget arguments
         single_commands = []
         for r, l in zip(remote_paths, local_destination):
             single_commands += [l + " -o " + r]
-
+        # Assemble the mget command, options and arguments
         multi_command = f"mget -P {n} " + " ".join(remote_paths)
+        # Execute the mget command
         self.execute_command(multi_command, output=blocking, blocking=blocking)
+        # Check if the files were downloaded TODO: is this too slow? Should we just assume that the files were downloaded for efficiency?
         for l in local_destination:
             if not os.path.exists(l):
                 raise RuntimeError(f"Failed to download {l}")
 
+        # Store the last download for later use (nice for debugging)
         self.last_download = local_destination
         self.last_type = "multi"
+        # Return the local paths of the downloaded files
         return local_destination
     
     def get_file_index(self, skip: int=0, nmax: Union[int, None]=None, override: bool=False) -> List[str]:
@@ -630,10 +633,12 @@ class IOHandler(ImplicitMount):
             file_index_exists = False
         # If the file index does not exist, create it
         if not file_index_exists:
-            raise NotImplementedError("Creating file index is not implemented yet.")
-            # TODO: Fix the command below.
-            # This works in a local shell, but not in the lftp shell:
-            # self.execute_command("find . -type f -exec realpath --relative-to=. {} \; > folder_index.txt")
+            files = self.ls(recursive=True)
+            with open("folder_index.txt", "w") as f:
+                for file in files:
+                    f.write(file + "\n")
+            self.execute_command("put folder_index.txt")
+            os.remove("folder_index.txt")
         
         # Download the file index
         file_index_path = self.download("folder_index.txt")
@@ -652,28 +657,28 @@ class IOHandler(ImplicitMount):
         self.cache["file_index"] = self.get_file_index(skip, nmax, override)
 
     def store_last(self, dst: str):
+        # TODO: This function should really be split into two; 
+        # 1) Handling the self.last_download/self.last_type variables
+        # 2) Moving files/directories
+
         # If the last download was a single file, the destination should be a file.
         # Otherwise, it should be a directory.
         if self.last_download is None:
             warnings.warn("No last download to store")
             return
         if self.last_type == "unknown":
-            # This should only happen if the last download was a multi download
-            # In this case the last type must be inferred from the last_download path (by checking if it has a file extension)
+            # This should only happen if the last download was a multi download (read the rest of the function)
+            # In this case the last type must be inferred from the last_download path (no file extension => directory; TODO: This is unsafe.)
             self.last_type = "file" if os.path.splitext(self.last_download)[1] != "" else "directory"
         # Check if destination has file extension (if last download was a file) or not (if last download was a directory)
         dst_has_ext = os.path.splitext(dst)[1] != ""
         if self.last_type == "file":
             if not dst_has_ext:
                 raise ValueError("Destination must have file extension if it is NOT a directory.")
-            # self.execute_command(f"local mv {self.last_download} {dst}")
-            # Use shutil instead
             shutil.move(self.last_download, dst)
         elif self.last_type == "directory":
             if dst_has_ext:
                 raise ValueError("Destination must NOT have file extension if it IS a directory.")
-            # self.execute_command(f"local mv {self.last_download} {dst}")
-            # Use shutil instead
             shutil.move(self.last_download, dst)
             
         # This part is too complicated, and is used to handle the case where the last download was a multi download only
