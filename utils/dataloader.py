@@ -105,8 +105,18 @@ class PretrainingDataset(Dataset):
     def __getitem__(self, idx):
         image_path, family, genus, species, uuid = self.images[idx]
 
-        image = read_image(image_path)
+        image_type = os.path.splitext(image_path)[1]
+        if not image_type in ['.jpg', '.jpeg', '.png']:
+            image = self.read_non_standard_image(image_path, image_type)
+        else:
+            image = read_image(image_path)
         if self.transform:
             image = self.transform(image)
         
         return image, self.class_labels[species]
+    
+    def read_non_standard_image(self, image_path, type):
+        # TODO: implement this
+        # The function should handle diverse image formats, such as .tif and .bmp.
+        # The function should return a tensor.
+        raise NotImplementedError(f"Reading non-standard images ({type}) not implemented yet!")

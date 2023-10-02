@@ -27,6 +27,9 @@ def get_mount_config():
 def get_dataloader_config():
     return config['dataloader']
 
+def get_implicit_mount_config():
+    return config['implicit_mount']
+
 def deparse_args(config, what):
     if not isinstance(what, str):
         raise TypeError("Expected string, got {}".format(type(what)))

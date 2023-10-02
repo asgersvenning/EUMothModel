@@ -22,8 +22,11 @@ def mount(remote_directory = remote, remote_subdirectory = remote_subdir, local_
         return False
     
     # Create mount command
-    mount_cmd = f'rclone mount {remote_directory}:{remote_subdirectory} {local_directory}{deparse_args(config, "rclone")}'
-    print(f"Mounting remote directory with command: {mount_cmd}")
+    mount_args = deparse_args(config, "rclone")
+    format_mount_args = " \\\n  ".join(mount_args.split(" --"))
+    mount_cmd = f'rclone mount {remote_directory}:{remote_subdirectory} {local_directory}{mount_args}'
+    format_mount_cmd = f'rclone mount {remote_directory}:{remote_subdirectory} {local_directory} \\\n  {format_mount_args}'
+    print(f"Mounting remote directory with command: \n{format_mount_cmd}")
     # Mount remote directory
     mount_result = run(mount_cmd, shell=True, stdout=PIPE, stderr=PIPE)
     # Check if directory was mounted
