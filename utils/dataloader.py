@@ -22,101 +22,197 @@
 # The classes are the species in the dataset.
 # The class labels are the indices of the species, sorted alphabetically, in the dataset.
 
-import os, re
-from torch.utils.data import Dataset
-from torchvision import transforms
+import os, time
+
 from torchvision.io import read_image
-import utils.config as c
+from torch.utils.data import DataLoader, IterableDataset, SequentialSampler
+from .implicit_mount import RemotePathIterator
+from queue import Queue
+from threading import Thread, Lock
 
-# TODO: add configs for image size, batch size, etc.
-config = c.get_dataloader_config()
-root_dir = c.get_mount_config()['local']
+import warnings
+from typing import Iterator, List, Tuple, Union
 
-# All images have a unique id, which is used in their naming scheme: UUID.jpg/jpeg
-class PretrainingImages:
-    def __init__(self, dir, index = True, n_max = -1):
-        self.dir = dir
-        self.images = []
-        self.family = []
-        self.genus = []
-        self.species = []
-        self.uuids = []
-
-        if index:
-            index_file = f'{self.dir}{os.sep}folder_index.txt'
-            if not os.path.exists(index_file):
-                raise ValueError(f'Index file {index_file} does not exist')
-            with open(index_file, "r") as index:
-                for line_i, path in enumerate(index.readlines()):
-                    if n_max != -1 and line_i >= n_max:
-                        break
-                    path = path.rstrip('\n')
-                    file_ext = re.findall("\\.\w{2,4}$", path)
-                    if not file_ext or len(file_ext) > 1:
-                        print(f'No or invalid file extension found for {path}')
-                        continue
-                    file_ext = file_ext[0]
-                    self.images += [path]
-                    parts = re.findall(f'(?<={re.escape(self.dir)}{os.sep}).+', path)[0]
-                    family, genus, species, uuid = parts.split(os.sep)
-                    uuid = uuid.rstrip(file_ext)
-                    self.family += [family]
-                    self.genus += [genus]
-                    self.species += [species]
-                    self.uuids += [uuid]
-        else:
-            assert NotImplementedError("Indexing not implemented yet")
-        # for family in os.listdir(root_dir):
-        #     for genus in os.listdir(os.path.join(root_dir, family)):
-        #         for species in os.listdir(os.path.join(root_dir, family, genus)):
-        #             for image in os.listdir(os.path.join(root_dir, family, genus, species)):
-        #                 uuid = image.split('.')[0]
-        #                 self.family.append(family)
-        #                 self.genus.append(genus)
-        #                 self.species.append(species)
-        #                 self.uuids.append(uuid)
-        #                 self.images.append(os.path.join(root_dir, family, genus, species, image))
-
-    def __len__(self):
-        return len(self.uuids)
-    
-    def __getitem__(self, idx):
-        if not isinstance(idx, int):
-            raise TypeError("Expected int, got {}".format(type(idx)))
-        if idx < 0 or idx >= len(self.uuids):
-            raise IndexError("Index out of bounds")
+class RemotePathDataset(IterableDataset):
+    def __init__(self, remote_path_iterator : "RemotePathIterator", prefetch: int=3, transform=None, target_transform=None):
+        # Check if remote_path_iterator is of type RemotePathIterator
+        if not isinstance(remote_path_iterator, RemotePathIterator):
+            raise ValueError("Argument remote_path_iterator must be of type RemotePathIterator.")
+        # Check if prefetch is an integer
+        if not isinstance(prefetch, int):
+            raise ValueError("Argument prefetch must be an integer.")
+        # Check if prefetch is greater than 0
+        if prefetch < 1:
+            raise ValueError("Argument prefetch must be greater than 0.")
         
-        return self.images[idx], self.family[idx], self.genus[idx], self.species[idx], self.uuids[idx]
+        # Store the remote_path_iterator backend
+        self.remote_path_iterator = remote_path_iterator
 
+        # Initialize the buffers
+        self.buffer = Queue(maxsize=prefetch)  # Tune maxsize as needed
+        self.processed_buffer = Queue(maxsize=prefetch)  # Tune maxsize as needed
 
-class PretrainingDataset(Dataset):
-    def __init__(self, dir=root_dir, n_max=-1, transform=None):
-        super().__init__()
-        self.dir = dir
+        # We don't want to start the buffer filling thread until the dataloader is called for iteration
+        self.thread = None
+        # We need to keep track of whether the buffer filling thread has been initiated or not
+        self.thread_initiated = False
+
+        # Initialize the worker threads
+        self.worker_threads = []
+
+        # Get the classes and their indices
+        classes = sorted(list(set([path.split('/')[-2] for path in self.remote_path_iterator])))
+        self.class_to_idx = {classes[i]: i for i in range(len(classes))}
+
+        # Set the transforms
         self.transform = transform
-        self.images = PretrainingImages(dir=self.dir, n_max=n_max)
-        self.classes = sorted(list(set(self.images.species)))
-        self.class_labels = {self.classes[i] : i for i in range(len(self.classes))}
-        self.label2class = {i : self.classes[i] for i in range(len(self.classes))}
+        self.target_transform = target_transform
         
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
-        image_path, family, genus, species, uuid = self.images[idx]
+        # Set the buffer filling parameters (Watermark Buffering)
+        self.buffer_minfill, self.buffer_maxfill = 0.2, 0.8
 
-        image_type = os.path.splitext(image_path)[1]
-        if not image_type in ['.jpg', '.jpeg', '.png']:
-            image = self.read_non_standard_image(image_path, image_type)
+        # Set the number of workers (threads) for processing
+        self.num_workers = 1
+        self.lock = Lock()
+
+    def _init_buffer(self):
+        # Check if the buffer filling thread has been initiated
+        if not self.thread_initiated:
+            # Start the buffer filling thread
+            self.thread = Thread(target=self._fill_buffer)
+            self.thread.daemon = True
+            self.thread.start()
+            # Set the flag to indicate that the thread has been initiated
+            self.thread_initiated = True
         else:
-            image = read_image(image_path)
+            # Raise an error if the buffer filling thread has already been initiated
+            raise RuntimeError("Buffer filling thread already initiated.")
+
+    def _fill_buffer(self):
+        # Calculate the min and max fill values for the buffer
+        min_fill = int(self.buffer.maxsize * self.buffer_minfill) 
+        max_fill = int(self.buffer.maxsize * self.buffer_maxfill)
+
+        for item in self.remote_path_iterator:
+            # Get the current size of the buffer
+            current_buffer_size = self.buffer.qsize()
+
+            # Decide whether to fill the buffer based on its current size
+            should_fill = current_buffer_size < max_fill or current_buffer_size < min_fill
+
+            # Sleep logic which ensures that the buffer doesn't switch between filling and not filling too often (Watermark Buffering)
+            while not should_fill:
+                time.sleep(0.1)
+                current_buffer_size = self.buffer.qsize() # Update the current buffer size )
+                should_fill = current_buffer_size < min_fill # Wait until the buffer drops below min_fill
+
+            # Fill the buffer
+            self.buffer.put(item)
+        
+        # Signal the end of the iterator by putting None in the buffer
+        self.buffer.put(None)
+    
+    def _process_buffer(self):
+        while True:
+            with self.lock:  # Ensure thread-safety when accessing buffers
+                # Get the next item from the buffer
+                item = self.buffer.get()
+
+            # Preprocess the item (e.g. read image, apply transforms, etc.) and put it in the processed buffer
+            processed_item = self.parse_item(*item) if item is not None else None
+            with self.lock:  # Ensure thread-safety when accessing buffers
+                self.processed_buffer.put(processed_item)
+
+            # Check if the buffer is empty, signaling the end of the iterator
+            if item is None:
+                if self.thread.is_alive(): # Check if the buffer filling thread is still alive
+                    raise RuntimeError("Buffer filling thread is still alive, but buffer signaled end of iteration.")
+                self.thread_initiated = False  # Reset the flag to indicate that the thread is no longer active
+                break  # Close the thread
+
+    def __iter__(self):
+        # Initialize the buffer filling thread
+        self._init_buffer()
+        
+        # Check number of workers
+        if self.num_workers == 0:
+            self.num_workers = 1
+        if self.num_workers < 1:
+            raise ValueError("Number of workers must be greater than 0.")
+
+        # Start consumer threads for processing
+        for _ in range(self.num_workers):
+            consumer_thread = Thread(target=self._process_buffer)
+            consumer_thread.daemon = True
+            consumer_thread.start()
+            self.worker_threads.append(consumer_thread)
+
+        return self
+
+    def __next__(self):
+        # Fetch from processed_buffer instead
+        processed_item = self.processed_buffer.get()
+        if processed_item is None:
+            # Handle shutdown logic
+            for worker in self.worker_threads:
+                if worker.is_alive():
+                    raise RuntimeError("Worker thread is still alive, but processed buffer signaled end of iteration.")
+            raise StopIteration
+
+        return processed_item
+
+    def __len__(self):
+        return len(self.remote_path_iterator)
+    
+    def parse_item(self, path, label):
+        # Check if image format is supported (jpeg/jpg/png)
+        image_type = os.path.splitext(path)[-1]
+        if image_type not in ['.jpg', '.jpeg', '.png']:
+            raise ValueError(f"Image format of {path} ({image_type}) is not supported.")
+        image = read_image(path)
         if self.transform:
             image = self.transform(image)
-        
-        return image, self.class_labels[species]
+        family, genus, species = path.split('/')[-4:-1]
+        # TODO: Use the family and genus information (or add a "species only" flag)
+        label = self.class_to_idx[species]
+        if self.target_transform:
+            label = self.target_transform(label)
+        return image, label
     
-    def read_non_standard_image(self, image_path, type):
-        # TODO: implement this
-        # The function should handle diverse image formats, such as .tif and .bmp.
-        # The function should return a tensor.
-        raise NotImplementedError(f"Reading non-standard images ({type}) not implemented yet!")
+class SequentialShuffleSampler(SequentialSampler):
+    def __init__(self, data_source: "RemotePathDataset"):
+        super(SequentialShuffleSampler, self).__init__(data_source)
+    
+    def __iter__(self):
+        self.data_source.remote_path_iterator.shuffle()
+        return super(SequentialShuffleSampler, self).__iter__()
+
+class CustomDataLoader(DataLoader):
+    def __init__(self, dataset: "RemotePathDataset", *args, **kwargs):
+        # Snipe arguments from the user which would break the custom dataloader (e.g. sampler, shuffle, etc.)
+        unsupported_kwargs = ['sampler', 'batch_sampler']
+        for unzkw in unsupported_kwargs:
+            value = kwargs.pop(unzkw, None)
+            if value is not None:
+                warnings.warn(f"Argument {unzkw} is not supported in this custom DataLoader. {unzkw}={value} will be ignored.")
+
+        # Override the shuffle argument handling (default is False)
+        shuffle = kwargs.pop('shuffle', False)
+        # Override the num_workers argument handling (default is 0) and pass it to the dataset
+        dataset.num_workers = kwargs.pop('num_workers', 0)
+        
+        if not isinstance(dataset, RemotePathDataset):
+            raise ValueError("Argument dataset must be of type RemotePathDataset.")
+
+        # Initialize the dataloader
+        super(CustomDataLoader, self).__init__(
+            shuffle=False,
+            sampler=SequentialSampler(dataset) if not shuffle else SequentialShuffleSampler(dataset), 
+            num_workers=0,
+            *args, 
+            **kwargs)
+
+    def __setattr__(self, name, value):
+        if name in ['batch_sampler', 'sampler', 'dataset']:
+            raise ValueError(f"Changing {name} is not allowed in this custom DataLoader.")
+        super(CustomDataLoader, self).__setattr__(name, value)

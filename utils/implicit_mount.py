@@ -1,7 +1,7 @@
 import subprocess, os, warnings, tempfile, shutil, time, uuid, re, threading, queue
 from typing import List, Union, Set, Tuple
-from multiprocessing import Pool, cpu_count
 from queue import Queue
+from random import shuffle
 
 from utils.config import get_implicit_mount_config
 
@@ -272,16 +272,22 @@ class ImplicitMount:
         # It is quite inefficient, but it is only used for the ls command, which is not performance critical?
         # Folder index files should be used instead of ls in most cases, 
         # but this function is still useful for debugging and for creating the folder index files
-        def sanitize_path(list, path) -> None:
+        def sanitize_path(l, path) -> None:
             if not path:
                 return
             if isinstance(path, str):
                 path = [path]
+            if not isinstance(path, list):
+                raise TypeError("Expected list, str or None, got {}".format(type(path)))
             for p in path:
+                # Skip "." and ".." paths and folder index files (these are created by the folder index command, and should be treated as hidden files)
+                if len(p) < 2 or "folder_index.txt" in p:
+                    continue
+                # Remove leading "./" from paths
                 if p.startswith("."):
                     p = p[2:]
-                if not "folder_index.txt" in p:
-                    list += [p]
+                # Append path to list (this a mutative operation)
+                l += [p]
         
         # Recursive ls is implemented by using the "cls" command, which returns a list of permissions and paths
         # and then recursively calling ls on each of the paths that are directories, 
@@ -303,10 +309,11 @@ class ImplicitMount:
             return output
         # Non-recursive case
         else:
-            output = self.execute_command(f"cls {path} -1")
+            cls_output = self.execute_command(f"cls {path} -1")
 
-        # Sanitize output and return	        
-        sanitize_path([], output)
+        # Sanitize output and return
+        output = []
+        sanitize_path(output, cls_output)
         if not isinstance(output, list):
             TypeError("Expected list, got {}".format(type(output)))
         
@@ -380,119 +387,9 @@ class ImplicitMount:
         new_files = post_download_files - pre_existing_files
         
         return list(new_files)
-        
-
-class RemotePathIterator:
-    def __init__(self, io_handler: "IOHandler", batch_size: int=64, batch_parallel: int=10, max_queued_batches: int=3, n_local_files: int=3*64, **kwargs):
-        self.io_handler = io_handler
-        if "file_index" not in self.io_handler.cache:
-            self.remote_paths = self.io_handler.get_file_index(**kwargs)
-        else:
-            if kwargs:
-                warnings.warn(f'Using cached file index. [{", ".join(kwargs.keys())}] will be ignored.')
-            self.remote_paths = self.io_handler.cache["file_index"]
-        self.temp_dir = self.io_handler.lpwd()
-        self.batch_size = batch_size
-        self.batch_parallel = batch_parallel
-        self.max_queued_batches = max_queued_batches
-        self.n_local_files = n_local_files
-        if self.n_local_files < self.batch_size:
-            warnings.warn(f"n_local_files ({self.n_local_files}) is less than batch_size ({self.batch_size}). This may cause files to be deleted before they are consumed. Consider increasing n_local_files. Recommended value: {self.batch_size * self.max_queued_batches}")
-        self.idx = 0
-        self.download_queue = Queue()
-        self.delete_queue = Queue()
-        self.stop_requested = False
-        self.not_cleaned = True
-
-        # State variables
-        self.download_thread = None
-        self.last_item = None
-        self.last_batch_consumed = 0
-        self.consumed_files = 0
-
-    def download_files(self):
-        queued_batches = 0
-        for i in range(0, len(self.remote_paths), self.batch_size):
-            if self.stop_requested:
-                break
-                
-            while queued_batches >= self.max_queued_batches and not self.stop_requested:
-                # Wait until a batch has been consumed (or multiple batches, if the consumer is fast and the producer is slow) before downloading another batch
-                if self.last_batch_consumed > 0:
-                    self.last_batch_consumed -= 1
-                    break
-                time.sleep(0.01)  # Wait until a batch has been consumed
-
-            batch = self.remote_paths[i:i + self.batch_size]
-            local_paths = self.io_handler.download(batch, n = self.batch_parallel)
-            for local_path, remote_path in zip(local_paths, batch):
-                self.download_queue.put((local_path, remote_path))
-                
-            queued_batches += 1
-            
-            # Deletion logic moved to __next__ to maintain minimal queued files
-
-    def start_download_queue(self) -> None:
-        self.download_thread = threading.Thread(target=self.download_files)
-        self.download_thread.start()
-
-    def __iter__(self) -> "RemotePathIterator":
-        self.start_download_queue()
-        return self
-    
-    def __len__(self) -> int:
-        return len(self.remote_paths)
-
-    def __next__(self) -> Tuple[str, str]:
-        # Delete files if the queue is too large
-        while self.delete_queue.qsize() > self.n_local_files:
-            try:
-                os.remove(self.delete_queue.get())
-            except Exception as e:
-                warnings.warn(f"Failed to remove file: {e}")
-
-        # Handle stop request and end of iteration
-        if self.stop_requested or self.idx >= len(self.remote_paths):
-            self.__del__()
-            raise StopIteration
-
-        # Get next item from queue or raise error if queue is empty
-        try:
-            next_item = self.download_queue.get() # Timeout not applicable, since there is no guarantees on the size of the files or the speed of the connection
-            # Update state to ensure that the producer keeps the queue prefilled
-            # It is a bit complicated because the logic must be able to handle the case where the consumer is faster than the producer,
-            # in this case the producer may be multiple batches behind the consumer.
-            self.consumed_files += 1
-            if self.consumed_files >= self.batch_size:
-                self.consumed_files -= self.batch_size
-                self.last_batch_consumed += 1
-        except queue.Empty: # TODO: Can this happen?
-            if self.stop_requested:
-                self.__del__()
-                raise StopIteration
-            else:
-                raise RuntimeError("Download queue is empty but no stop was requested. Check the download thread.")
-
-        # Update state
-        self.idx += 1
-        self.delete_queue.put(next_item)
-        
-        # Return next item
-        return next_item
-
-    def __del__(self) -> None:
-        if self.not_cleaned:
-            self.stop_requested = True
-            self.download_thread.join(timeout=10)
-            while not self.download_queue.empty():
-                try:
-                    os.remove(self.download_queue.get())
-                except Exception as e:
-                    warnings.warn(f"Failed to remove file: {e}")
-                    
 
 class IOHandler(ImplicitMount):
-    def __init__(self, local_dir: Union[str, None]=None, user_confirmation: bool=False, clean: Union[bool, None]=None, n_threads: Union[int, None]=None, **kwargs):
+    def __init__(self, local_dir: Union[str, None]=None, user_confirmation: bool=False, clean: Union[bool, None]=None, **kwargs):
         super().__init__(**kwargs)
         if local_dir is None:
             if self.default_config['local_dir'] is None:
@@ -530,10 +427,6 @@ class IOHandler(ImplicitMount):
         if self.do_clean:
             self.clean()
         self.unmount()
-        if self.pool is not None:
-            self.pool.close()
-            self.pool.join()
-        self.pool = None
 
     # Methods for using the IOHandler without context management
     def start(self) -> None:
@@ -622,10 +515,9 @@ class IOHandler(ImplicitMount):
     
     def get_file_index(self, skip: int=0, nmax: Union[int, None]=None, override: bool=False) -> List[str]:
         # Check if file index exists
-        files_in_dir = self.ls()
-        file_index_exists = "folder_index.txt" in files_in_dir
+        file_index_exists = self.execute_command('glob -f --exist *folder_index.txt && echo "YES" || echo "NO"') == "YES"
         if not file_index_exists:
-            raise RuntimeError(f"Folder index does not exist in {files_in_dir}")
+            raise RuntimeError(f"Folder index does not exist in {self.pwd()}")
         # If override is True, delete the file index if it exists
         if override and file_index_exists:
             self.execute_command("rm folder_index.txt")
@@ -740,3 +632,174 @@ class IOHandler(ImplicitMount):
         else:
             warnings.warn("Last download was not in original local directory. Not cleaning.")
 
+class RemotePathIterator:
+    def __init__(self, io_handler: "IOHandler", batch_size: int=64, batch_parallel: int=10, max_queued_batches: int=3, n_local_files: int=3*64, **kwargs):
+        self.io_handler = io_handler
+        if "file_index" not in self.io_handler.cache:
+            self.remote_paths = self.io_handler.get_file_index(**kwargs)
+        else:
+            if kwargs:
+                warnings.warn(f'Using cached file index. [{", ".join(kwargs.keys())}] will be ignored.')
+            self.remote_paths = self.io_handler.cache["file_index"]
+        self.temp_dir = self.io_handler.lpwd()
+        self.batch_size = batch_size
+        self.batch_parallel = batch_parallel
+        self.max_queued_batches = max_queued_batches
+        self.n_local_files = n_local_files
+        if self.n_local_files < self.batch_size:
+            warnings.warn(f"n_local_files ({self.n_local_files}) is less than batch_size ({self.batch_size}). This may cause files to be deleted before they are consumed. Consider increasing n_local_files. Recommended value: {self.batch_size * self.max_queued_batches}")
+        self.idx = 0
+        self.download_queue = Queue()
+        self.delete_queue = Queue()
+        self.stop_requested = False
+        self.not_cleaned = True
+
+        # State variables
+        self.download_thread = None
+        self.last_item = None
+        self.last_batch_consumed = 0
+        self.consumed_files = 0
+
+    def shuffle(self) -> None:
+        if self.download_thread is not None:
+            raise RuntimeError("Cannot shuffle while iterating.")
+        shuffle(self.remote_paths)
+
+    def subset(self, indices: List[int]) -> None:
+        if self.download_thread is not None:
+            raise RuntimeError("Cannot subset while iterating.")
+        self.remote_paths = [self.remote_paths[i] for i in indices]
+
+    def split(self, proportion: Union[float, None]=None, indices: Union[List[List[int]], None]=None) -> List["RemotePathIterator"]:
+        if self.download_thread is not None:
+            raise RuntimeError("Cannot split while iterating.")
+        if proportion is None and indices is None:
+            raise ValueError("Either proportion or indices must be specified.")
+        if proportion is not None and indices is not None:
+            raise ValueError("Only one of proportion or indices must be specified.")
+        if proportion is not None:
+            if not isinstance(proportion, list):
+                raise TypeError("proportion must be a list.")
+            if any([not isinstance(i, float) for i in proportion]):
+                raise TypeError("All proportions must be floats.")
+            if any([i < 0 or i > 1 for i in proportion]):
+                raise ValueError("All proportions must be between 0 and 1.")
+            if sum(proportion) != 1:
+                proportion = [p / sum(proportion) for p in proportion]
+            # Assume we have the correct imports from random already
+            from random import choices, choice
+            allocation = choices(list(range(len(proportion))), weights=proportion, k=len(self.remote_paths))
+            indices = [[] for _ in range(len(proportion))]
+            for i, a in enumerate(allocation):
+                indices[a].append(i)
+        if indices is not None:
+            if not isinstance(indices, list):
+                raise TypeError("indices must be a list.")
+            if any([not isinstance(i, list) for i in indices]):
+                raise TypeError("indices must be a list of lists.")
+            if any([any([not isinstance(j, int) for j in i]) for i in indices]):
+                raise TypeError("indices must be a list of lists of ints.")
+            if any([any([j < 0 or j >= len(self.remote_paths) for j in i]) for i in indices]):
+                raise ValueError("indices must be a list of lists of ints in the range [0, len(remote_paths)).")
+            if any([len(i) == 0 for i in indices]):
+                raise ValueError("All indices must be non-empty.")
+        else:
+            raise RuntimeError("This should never happen.")
+            
+        iterators = []
+        for i in indices:
+            this = RemotePathIterator(self.io_handler, batch_size=self.batch_size, batch_parallel=self.batch_parallel, max_queued_batches=self.max_queued_batches, n_local_files=self.n_local_files)
+            this.subset(i)
+            iterators.append(this)
+
+        return iterators
+
+    def download_files(self):
+        queued_batches = 0
+        for i in range(0, len(self.remote_paths), self.batch_size):
+            if self.stop_requested:
+                break
+                
+            while queued_batches >= self.max_queued_batches and not self.stop_requested:
+                # Wait until a batch has been consumed (or multiple batches, if the consumer is fast and the producer is slow) before downloading another batch
+                if self.last_batch_consumed > 0:
+                    self.last_batch_consumed -= 1
+                    break
+                time.sleep(0.01)  # Wait until a batch has been consumed
+
+            batch = self.remote_paths[i:i + self.batch_size]
+            local_paths = self.io_handler.download(batch, n = self.batch_parallel)
+            for local_path, remote_path in zip(local_paths, batch):
+                self.download_queue.put((local_path, remote_path))
+                
+            queued_batches += 1
+            
+            # Deletion logic moved to __next__ to maintain minimal queued files
+
+    def start_download_queue(self) -> None:
+        self.download_thread = threading.Thread(target=self.download_files)
+        self.download_thread.start()
+
+    def __iter__(self) -> "RemotePathIterator":
+        self.stop_requested = False
+        self.start_download_queue()
+        return self
+    
+    def __len__(self) -> int:
+        return len(self.remote_paths)
+
+    def __next__(self) -> Tuple[str, str]:
+        # Handle stop request and end of iteration
+        if self.stop_requested or self.idx >= len(self.remote_paths):
+            self.__del__()
+            raise StopIteration
+
+        # Delete files if the queue is too large
+        while self.delete_queue.qsize() > self.n_local_files:
+            try:
+                os.remove(self.delete_queue.get())
+            except Exception as e:
+                warnings.warn(f"Failed to remove file: {e}")
+
+        # Get next item from queue or raise error if queue is empty
+        try:
+            next_item = self.download_queue.get() # Timeout not applicable, since there is no guarantees on the size of the files or the speed of the connection
+            # Update state to ensure that the producer keeps the queue prefilled
+            # It is a bit complicated because the logic must be able to handle the case where the consumer is faster than the producer,
+            # in this case the producer may be multiple batches behind the consumer.
+            self.consumed_files += 1
+            if self.consumed_files >= self.batch_size:
+                self.consumed_files -= self.batch_size
+                self.last_batch_consumed += 1
+        except queue.Empty: # TODO: Can this happen?
+            if self.stop_requested:
+                self.__del__()
+                raise StopIteration
+            else:
+                raise RuntimeError("Download queue is empty but no stop was requested. Check the download thread.")
+
+        # Update state
+        self.idx += 1
+        self.delete_queue.put(next_item[0])
+        
+        # Return next item (local path, remote path => can be parsed to get the class label)
+        return next_item
+
+    def __del__(self) -> None:
+        if self.not_cleaned:
+            # Force the iterator to stop if it is not already stopped
+            self.stop_requested = True
+            # Wait for the download thread to finish
+            self.download_thread.join()
+            self.download_thread = None
+            # Clean up the temporary directory
+            while not self.download_queue.empty():
+                try:
+                    os.remove(self.download_queue.get())
+                except Exception as e:
+                    warnings.warn(f"Failed to remove file: {e}")
+            while not self.delete_queue.empty():
+                try:
+                    os.remove(self.delete_queue.get())
+                except Exception as e:
+                    warnings.warn(f"Failed to remove file: {e}")
