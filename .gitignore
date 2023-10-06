@@ -2,3 +2,5 @@ erda-home
 config.yaml
 __pycache__
 test
+logs
+*.png

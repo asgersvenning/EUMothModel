@@ -27,6 +27,7 @@ class ImplicitMount:
         
         # Set attributes
         self.user = user
+        self.password = "" # Assume we use passwordless lftp (authentication is handled by ssh keys, not sftp)
         self.remote = remote
         self.strict = strict
         self.lftp_shell = None
@@ -175,7 +176,7 @@ class ImplicitMount:
         if self.verbose:
             print(f"Mounting {self.remote} as {self.user}")
         # "Mount" the remote directory using an lftp shell with the sftp protocol and the specified user and remote, and the specified lftp settings
-        lftp_mount_cmd = f'open -u {self.user} -p 2222 sftp://{self.remote};{lftp_settings_str}'
+        lftp_mount_cmd = f'open -u {self.user},{self.password} -p 2222 sftp://{self.remote};{lftp_settings_str}'
         if self.verbose:
             print(f"Executing command: lftp")
         # Start the lftp shell
@@ -542,6 +543,8 @@ class IOHandler(ImplicitMount):
                     continue
                 if nmax is not None and i >= (skip + nmax):
                     break
+                if "folder_index.txt" in line:
+                    continue
                 file_index.append(line.strip())
         return file_index
     
@@ -633,7 +636,7 @@ class IOHandler(ImplicitMount):
             warnings.warn("Last download was not in original local directory. Not cleaning.")
 
 class RemotePathIterator:
-    def __init__(self, io_handler: "IOHandler", batch_size: int=64, batch_parallel: int=10, max_queued_batches: int=3, n_local_files: int=3*64, **kwargs):
+    def __init__(self, io_handler: "IOHandler", batch_size: int=64, batch_parallel: int=10, max_queued_batches: int=3, n_local_files: int=2*3*64, clear_local: bool=False, **kwargs):
         self.io_handler = io_handler
         if "file_index" not in self.io_handler.cache:
             self.remote_paths = self.io_handler.get_file_index(**kwargs)
@@ -647,12 +650,13 @@ class RemotePathIterator:
         self.max_queued_batches = max_queued_batches
         self.n_local_files = n_local_files
         if self.n_local_files < self.batch_size:
-            warnings.warn(f"n_local_files ({self.n_local_files}) is less than batch_size ({self.batch_size}). This may cause files to be deleted before they are consumed. Consider increasing n_local_files. Recommended value: {self.batch_size * self.max_queued_batches}")
+            warnings.warn(f"n_local_files ({self.n_local_files}) is less than batch_size ({self.batch_size}). This may cause files to be deleted before they are consumed. Consider increasing n_local_files. Recommended value: {2 * self.batch_size * self.max_queued_batches}")
         self.idx = 0
         self.download_queue = Queue()
         self.delete_queue = Queue()
         self.stop_requested = False
         self.not_cleaned = True
+        self.clear_local = clear_local
 
         # State variables
         self.download_thread = None
@@ -725,7 +729,7 @@ class RemotePathIterator:
                 if self.last_batch_consumed > 0:
                     self.last_batch_consumed -= 1
                     break
-                time.sleep(0.01)  # Wait until a batch has been consumed
+                time.sleep(0.2)  # Wait until a batch has been consumed
 
             batch = self.remote_paths[i:i + self.batch_size]
             local_paths = self.io_handler.download(batch, n = self.batch_parallel)
@@ -741,8 +745,19 @@ class RemotePathIterator:
         self.download_thread.start()
 
     def __iter__(self) -> "RemotePathIterator":
+        # Force reset state
+        self.not_cleaned = True
+        self.__del__()
+        self.idx = 0
+
+        # Prepare state for iteration
         self.stop_requested = False
+        self.not_cleaned = True
+        
+        # Start the download thread
         self.start_download_queue()
+
+        # Return self
         return self
     
     def __len__(self) -> int:
@@ -751,7 +766,9 @@ class RemotePathIterator:
     def __next__(self) -> Tuple[str, str]:
         # Handle stop request and end of iteration
         if self.stop_requested or self.idx >= len(self.remote_paths):
-            self.__del__()
+            if self.clear_local:
+                self.__del__()
+            self.stop_requested = False
             raise StopIteration
 
         # Delete files if the queue is too large
@@ -790,8 +807,9 @@ class RemotePathIterator:
             # Force the iterator to stop if it is not already stopped
             self.stop_requested = True
             # Wait for the download thread to finish
-            self.download_thread.join()
-            self.download_thread = None
+            if self.download_thread is not None:
+                self.download_thread.join()
+                self.download_thread = None
             # Clean up the temporary directory
             while not self.download_queue.empty():
                 try:
