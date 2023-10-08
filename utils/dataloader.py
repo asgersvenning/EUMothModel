@@ -242,10 +242,17 @@ class RemotePathDataset(IterableDataset):
             # raise ValueError(f"Image format of {remote_path} ({image_type}) is not supported.")
             # Instead of raising an error, we can skip the image instead
             return None
-        image = read_image(local_path)
+        try:
+            image = read_image(local_path)
+        except:
+            print(f"Error reading image {remote_path}.")
+            return None
         # Remove the alpha channel if present
         if image.shape[0] == 4:
             image = image[:3]
+        if image.shape[0] != 3:
+            print(f"Error reading image {remote_path}.")
+            return None
         # Apply transforms (preprocessing)
         if self.transform:
             image = self.transform(image)

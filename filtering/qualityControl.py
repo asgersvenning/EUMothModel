@@ -1,4 +1,10 @@
 # This script is used to filter out images of larvae from the dataset.
+# OBS: 
+# * All images not of types ['JPEG', 'PNG', 'JPG', 'jpeg', 'png', 'jpg'] are ignored.
+# * Inference is performed without the alpha channel (if present).
+# * Greyscale images are skipped.
+# * If an error occurs during inference, the error is logged to a log file and the inference process can be resumed from the last batch by setting the 'skip' variable to the number of batches to skip (Recommended: batch where error occurred minus one, after fixing the error).
+
 
 # `os` is imported first to ensure that the working directory is set to the root of the project
 import os, sys
@@ -47,6 +53,7 @@ if __name__ == "__main__":
     ## Hyperparameters
     model_name = "qualityControlV1" # Name of model weights file (assumes .pt extension and that the file is located in the models/ directory)
     batch_size = 64 # Batch size for inference 
+    skip = 26816 * batch_size # Number of batches to skip (used to resume inference from a specific batch)
 
     # Device and dtype setup
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -60,7 +67,7 @@ if __name__ == "__main__":
     backend = IOHandler(verbose = False, clean=True)
     backend.start()
     backend.cd("AMI_GBIF_Pretraining_Data/root")
-    backend.cache_file_index()
+    backend.cache_file_index(skip=skip)
 
     # Model and dataset/loader setup
     # Partial model load, since model preprocessing must be passed to the dataset instance
@@ -143,11 +150,21 @@ if __name__ == "__main__":
                 # Error handling is logged to the log file instead of being raised
                 try:
                     # Model batch inference
-                    pred = model(input).argmax(dim=1).cpu()
+                    pred = model(input)
+                    # Prediction translation
+                    # Good prediction: Larvae % < 5 & High % >= 25
+                    # Bad prediction: Larvae % >= 5 & High % < 25
+
+                    # New code
                     # Label translation
-                    pcls = [QC_dict[i.item()] for i in pred]
+                    probs = torch.softmax(pred, dim=1)
+                    pcls_idx = torch.argmax(pred, dim=1)
+                    l_prob = pred[:, 0]
+                    h_prob = pred[:, 2]
+
                     # QC filtering
-                    NOT_Larvae = [p for p, c in zip(path, pcls) if c != "Larvae"]
+                    NOT_Larvae = [p for p, l, h in zip(path, l_prob, h_prob) if l < 0.05 and h >= 0.25]
+                    
                     # Move files to 'without_larvae' directory
                     if len(NOT_Larvae) > 0:
                         move_to_dir(NOT_Larvae, "without_larvae", backend)
@@ -155,12 +172,15 @@ if __name__ == "__main__":
                     # Log progress to log file every 100 batches
                     if i % 100 == 0:
                         f.write(f"Batch {i} completed. {total_files_transferred} images moved to 'without_larvae'.\n")
+                        f.flush()
+                    time.sleep(0.01)
                 except Exception as e:
                     # Log and print errors
                     print(f"Error at batch {i}: {e}")
                     tb_str = traceback.format_exception(etype=type(e), value=e, tb=e.__traceback__)
                     tb_str = ''.join(tb_str)
                     f.write(f"Error at batch {i}: {e}\nStack Trace:\n{tb_str}\n")
+                    f.flush()
         f.write(f"Total files transferred: {total_files_transferred}\n")
         f.write("Done.\n")
 

@@ -518,7 +518,7 @@ class IOHandler(ImplicitMount):
         # Check if file index exists
         file_index_exists = self.execute_command('glob -f --exist *folder_index.txt && echo "YES" || echo "NO"') == "YES"
         if not file_index_exists:
-            raise RuntimeError(f"Folder index does not exist in {self.pwd()}")
+            print(f"Folder index does not exist in {self.pwd()}")
         # If override is True, delete the file index if it exists
         if override and file_index_exists:
             self.execute_command("rm folder_index.txt")
@@ -526,8 +526,9 @@ class IOHandler(ImplicitMount):
             file_index_exists = False
         # If the file index does not exist, create it
         if not file_index_exists:
+            print("Creating folder index...")
             files = self.ls(recursive=True)
-            with open("folder_index.txt", "w") as f:
+            with open(f"{self.lpwd()}folder_index.txt", "w") as f:
                 for file in files:
                     f.write(file + "\n")
             self.execute_command("put folder_index.txt")
