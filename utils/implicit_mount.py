@@ -544,7 +544,7 @@ class IOHandler(ImplicitMount):
                     continue
                 if nmax is not None and i >= (skip + nmax):
                     break
-                if "folder_index.txt" in line:
+                if "folder_index.txt" == line[:16]:
                     continue
                 file_index.append(line.strip())
         return file_index
