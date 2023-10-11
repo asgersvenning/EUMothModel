@@ -3,4 +3,7 @@ config.yaml
 __pycache__
 test
 logs
+datasets
 *.png
+*.pt
+*.h5

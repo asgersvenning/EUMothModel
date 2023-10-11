@@ -24,10 +24,16 @@
 
 import os, time
 
-from torchvision.io import read_image
 import torch
-from torch.utils.data import DataLoader, IterableDataset
+from torch import Tensor
+from torchvision.io import read_image
+from torchvision.io.image import ImageReadMode
+from torch.utils.data import DataLoader, IterableDataset, TensorDataset
+
+import h5py, hdf5plugin
+
 from .implicit_mount import RemotePathIterator
+
 from queue import Queue
 from threading import Thread
 
@@ -35,7 +41,7 @@ import warnings
 from typing import Iterator, List, Tuple, Union
 
 class RemotePathDataset(IterableDataset):
-    def __init__(self, remote_path_iterator : "RemotePathIterator", prefetch: int=64, transform=None, target_transform=None, device: Union["torch.device", None]=None, dtype: Union[torch.dtype, None]=None, return_remote_path: bool=False):
+    def __init__(self, remote_path_iterator : "RemotePathIterator", prefetch: int=64, transform=None, target_transform=None, device: Union["torch.device", None]=None, dtype: Union[torch.dtype, None]=None, return_remote_path: bool=False, return_local_path: bool=False, verbose: bool=False):
         # Check if remote_path_iterator is of type RemotePathIterator
         if not isinstance(remote_path_iterator, RemotePathIterator):
             raise ValueError("Argument remote_path_iterator must be of type RemotePathIterator.")
@@ -45,6 +51,10 @@ class RemotePathDataset(IterableDataset):
         # Check if prefetch is greater than 0
         if prefetch < 1:
             raise ValueError("Argument prefetch must be greater than 0.")
+
+        ## General parameters
+        assert isinstance(verbose, bool), ValueError("Argument verbose must be a boolean.")
+        self.verbose = verbose
         
         ## PyTorch specific parameters 
         # Get the classes and their indices
@@ -52,7 +62,6 @@ class RemotePathDataset(IterableDataset):
         self.n_classes = len(self.classes)
         self.class_to_idx = {self.classes[i]: i for i in range(len(self.classes))}
         self.idx_to_class = {i: self.classes[i] for i in range(len(self.classes))}
-        self.return_remote_path = return_remote_path
 
         # Set the transforms
         self.transform = transform
@@ -65,6 +74,8 @@ class RemotePathDataset(IterableDataset):
         ## Backend specific parameters
         # Store the remote_path_iterator backend
         self.remote_path_iterator = remote_path_iterator
+        self.return_remote_path = return_remote_path
+        self.return_local_path = return_local_path
         self.shuffle = False
 
         ## Multi-threading parameters
@@ -133,9 +144,10 @@ class RemotePathDataset(IterableDataset):
         min_fill = int(self.buffer.maxsize * self.buffer_minfill) 
         max_fill = int(self.buffer.maxsize * self.buffer_maxfill)
 
-        print(f"Buffer min fill: {min_fill}, max fill: {max_fill}")
+        if self.verbose:
+            print(f"Buffer min fill: {min_fill}, max fill: {max_fill}")
+            print("Producer thread started.")
 
-        print("Producer thread started.")
         wait_for_min_fill = False
         for item in self.remote_path_iterator:
             # Get the current size of the buffer
@@ -153,21 +165,24 @@ class RemotePathDataset(IterableDataset):
 
             # Fill the buffer
             self.buffer.put(item)
-        
-        print("Producer signalling end of iterator.")
+        if self.verbose:
+            print("Producer signalling end of iterator.")
         # Signal the end of the iterator to the consumers by putting None in the buffer until all consumer threads have finished
         while self.consumers > 0:
             time.sleep(0.01)
             self.buffer.put(None)
-        print("Producer emptying buffer.")
+        if self.verbose:
+            print("Producer emptying buffer.")
         # Wait for the consumer threads to finish then clear the buffer
         while self.buffer.qsize() > 0:
             self.buffer.get()
         self.processed_buffer.put(None) # Signal the end of the processed buffer to the main thread
-        print("Producer thread finished.")
+        if self.verbose:
+            print("Producer thread finished.")
     
     def _process_buffer(self):
-        print("Consumer thread started.")
+        if self.verbose:
+            print("Consumer thread started.")
         self.consumers += 1
         while True:
             qsize = self.buffer.qsize()
@@ -178,6 +193,8 @@ class RemotePathDataset(IterableDataset):
                     break
             # Get the next item from the buffer
             item = self.buffer.get()
+            if self.verbose:
+                print("Consumer thread got item")
             # Check if the buffer is empty, signaling the end of the iterator
             if item is None:
                 break  # Close the thread
@@ -186,9 +203,12 @@ class RemotePathDataset(IterableDataset):
             processed_item = self.parse_item(*item) if item is not None else None
             if processed_item is not None:
                 self.processed_buffer.put(processed_item)
+            if self.verbose:
+                print("Consumer thread processed item")
 
         self.consumers -= 1
-        print("Consumer thread finished.")
+        if self.verbose:
+            print("Consumer thread finished.")
 
     def __iter__(self):
         # Check if the buffer filling thread has been initiated
@@ -243,7 +263,7 @@ class RemotePathDataset(IterableDataset):
             # Instead of raising an error, we can skip the image instead
             return None
         try:
-            image = read_image(local_path)
+            image = read_image(local_path, mode=ImageReadMode.RGB)
         except:
             print(f"Error reading image {remote_path}.")
             return None
@@ -274,11 +294,15 @@ class RemotePathDataset(IterableDataset):
         # if self.device is not None:
         #     label = label.to(device=self.device)
 
-        ## Return the image and label
-        if not self.return_remote_path: 
-            return image, label
-        else:
+        ## Return the image and label (and optionally the local and remote paths)
+        if self.return_local_path and self.return_remote_path:
+            return image, label, local_path, remote_path
+        elif self.return_local_path:
+            return image, label, local_path
+        elif self.return_remote_path:
             return image, label, remote_path
+        else:
+            return image, label
 
 class CustomDataLoader(DataLoader):
     def __init__(self, dataset: "RemotePathDataset", *args, **kwargs):
@@ -313,3 +337,18 @@ class CustomDataLoader(DataLoader):
     #     if name in ['batch_sampler', 'sampler']:
     #         raise (f"Changing {name} is not allowed in this custom DataLoader.")
     #     super(CustomDataLoader, self).__setattr__(name, value)
+
+
+class HDF5Dataset(TensorDataset):
+    def __init__(self, hdf5file, tensorname, classname, *args, **kwargs):
+        self.hdf5 = h5py.File(hdf5file, 'r')
+        self.tensors = self.hdf5[tensorname]
+        self.classes = self.hdf5[classname]
+        self.class_set = sorted(list(set(self.classes)))
+        self.n_classes = len(self.class_set)
+        self.class_to_idx = {self.class_set[i]: i for i in range(len(self.class_set))}
+        self.idx_to_class = {i: self.class_set[i] for i in range(len(self.class_set))}
+        super(HDF5Dataset, self).__init__(self.tensors, *args, **kwargs)
+
+    def __getitem__(self, index):
+        return super().__getitem__(index), self.class_to_idx[self.classes[index]]

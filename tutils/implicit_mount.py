@@ -3,7 +3,7 @@ from typing import List, Union, Set, Tuple
 from queue import Queue
 from random import shuffle
 
-from utils.config import get_implicit_mount_config
+from .config import get_implicit_mount_config
 
 class ImplicitMount:
     time_stamp_pattern = re.compile(r"^\s*(\S+\s+){8}") # This is used to strip the timestamp from the output of the lftp shell
@@ -260,6 +260,43 @@ class ImplicitMount:
         file_name = os.path.basename(remote_path)
         abs_local_path = os.path.abspath(os.path.join(local_destination, file_name))
         return abs_local_path
+    
+    def put(self, local_path: str, remote_destination: Union[str, None]=None, blocking: bool=True, execute: bool=True, output: Union[bool, None]=None, **kwargs):
+        def source_destiation(local_path: Union[str, List[str]], remote_destination: Union[str, List[str], None]=None) -> str:
+            if isinstance(local_path, str):
+                local_path = [local_path]
+            if not isinstance(local_path, list):
+                raise TypeError("Expected list or str, got {}".format(type(local_path)))
+            if remote_destination is None:
+                remote_destination = [os.path.basename(p) for p in local_path]
+            elif isinstance(remote_destination, str):
+                remote_destination = [remote_destination]
+            if not isinstance(remote_destination, list):
+                raise TypeError("Expected list or str, got {}".format(type(remote_destination)))
+            if len(local_path) != len(remote_destination):
+                raise ValueError("Expected local_path and remote_destination to have the same length, got {} and {} instead.".format(len(local_path), len(remote_destination)))
+            return " ".join([f"{l} -o {r}" for l, r in zip(local_path, remote_destination)])
+        
+        if output is None:
+            output = blocking
+        n = len(local_path) if isinstance(local_path, list) else 1
+        default_args = {"P" : n}
+        args = {**default_args, **kwargs}
+        formatted_args = self.format_options(**args)
+        full_command = f"put {formatted_args} {source_destiation(local_path, remote_destination)}"
+        exec_output = self.execute_command(
+            full_command, 
+            output=output, 
+            blocking=blocking,
+            execute=execute
+        )
+        if not execute:
+            return exec_output
+        
+        # Construct and return the absolute remote path
+        file_name = os.path.basename(local_path)
+        abs_remote_path = os.path.abspath(os.path.join(remote_destination, file_name))
+        return abs_remote_path
 
     def ls(self, path: str = ".", recursive: bool=False, use_cache: bool=True) -> List[str]:
         if path.startswith(".."):
@@ -531,7 +568,7 @@ class IOHandler(ImplicitMount):
             with open(f"{self.lpwd()}folder_index.txt", "w") as f:
                 for file in files:
                     f.write(file + "\n")
-            self.execute_command("put folder_index.txt")
+            self.put("folder_index.txt")
             os.remove("folder_index.txt")
         
         # Download the file index
@@ -544,7 +581,7 @@ class IOHandler(ImplicitMount):
                     continue
                 if nmax is not None and i >= (skip + nmax):
                     break
-                if "folder_index.txt" == line[:16]:
+                if len(line) < 3 or "folder_index.txt" == line[:16]:
                     continue
                 file_index.append(line.strip())
         return file_index
@@ -817,8 +854,9 @@ class RemotePathIterator:
                     os.remove(self.download_queue.get())
                 except Exception as e:
                     warnings.warn(f"Failed to remove file: {e}")
-            while not self.delete_queue.empty():
-                try:
-                    os.remove(self.delete_queue.get())
-                except Exception as e:
-                    warnings.warn(f"Failed to remove file: {e}")
+            if self.clear_local:
+                while not self.delete_queue.empty():
+                    try:
+                        os.remove(self.delete_queue.get())
+                    except Exception as e:
+                        warnings.warn(f"Failed to remove file: {e}")

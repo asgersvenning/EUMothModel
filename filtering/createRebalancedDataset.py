@@ -9,8 +9,8 @@ print("Working directory:", os.getcwd())
 sys.path.append(os.getcwd())
 
 # Import custom modules for ERDA data transfer
-from utils.implicit_mount import *
-from utils.dataloader import *
+from tutils.implicit_mount import *
+from tutils.dataloader import *
 
 # Import other modules
 from tqdm import tqdm
@@ -121,7 +121,7 @@ if __name__ == "__main__":
         cls = path.split("/")[-2]
         class_paths[cls].append(path)
 
-    # with open("logs/test_rebalanced50_without_larvae.txt", "w") as f:
+    # with open("logs/test_rebalanced75_without_larvae.txt", "w") as f:
     #     # f.writelines(class_paths[list(class_paths.keys())[0]])
     #     # f.write("\n")
     #     for cls, paths in class_paths.items():
@@ -129,9 +129,17 @@ if __name__ == "__main__":
     
     # Copy pruned paths to new directory
     copy_pbar = tqdm(class_paths.items(), desc="Copying pruned paths", dynamic_ncols=True)
-    for cls, paths in copy_pbar:
-        copy_pbar.set_description(f"Copying pruned paths for class {cls} ({len(paths)} paths)")
-        move_to_dir(paths, f"rebalanced50_without_larvae", backend, verbose=False)
+    with open(f"{backend.lpwd()}/folder_index.txt", "w") as f:
+        for cls, paths in copy_pbar:
+            copy_pbar.set_description(f"Copying pruned paths for class {cls} ({len(paths)} paths)")
+            # move_to_dir(paths, f"rebalanced75_without_larvae", backend, verbose=False)
+            for path in paths:
+                f.write(f"{path}\n")
+        f.write("\n")
+    
+    backend.cd("AMI_GBIF_Pretraining_Data/rebalanced75_without_larvae")
+    backend.put("folder_index.txt")
+    
 
     # Close backend
     backend.stop()
