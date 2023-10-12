@@ -289,7 +289,12 @@ style_sheet = [
     # This would work on a local machine, but I need it to work through an SSH tunnel
     # os.path.join(os.path.dirname(__file__), 'activeLearning.css')
     # This works through an SSH tunnel
-    'https://raw.githubusercontent.com/asgersvenning/EUMothModel/main/filtering/activeLearning.css'
+    {
+        'href': 'https://raw.githubusercontent.com/asgersvenning/EUMothModel/main/filtering/activeLearning.css',
+        'rel': 'stylesheet',
+        'integrity': 'sha384-MCw98/SFnGE8fJT3GXwEOngsV7Zt27NXFoaoApmYm81iuXoPkFOJwJ8ERdknLPMO',
+        'crossorigin': 'anonymous'
+    }
 ]
 
 app = dash.Dash(__name__, external_stylesheets=style_sheet)

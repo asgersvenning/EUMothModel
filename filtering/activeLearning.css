@@ -1,11 +1,3 @@
-/* Table of contents
-––––––––––––––––––––––––––––––––––––––––––––––––––
-
-    # UNFINISHED
-
-––––––––––––––––––––––––––––––––––––––––––––––––––
-*/
-
 .control-button {
     color: white;
     background-color: black;
@@ -15,13 +7,17 @@
     border-radius: 5px;
     padding: 10px;
     margin: 10px;
-    transition: 0.5s ease-in-out; }
+    transition: 0.5s ease-in-out; 
+}
 .control-button:hover {
     background-color: #333;
-    cursor: pointer; }
+    cursor: pointer; 
+}
 .control-button:disabled {
     background-color: #999;
-    cursor: not-allowed; }
+    cursor: not-allowed; 
+}
 .control-button:active {
     background-color: #666;
-    transform: translateY(4px); }
+    transform: translateY(4px); 
+}
