@@ -1,3 +1,11 @@
+/* Table of contents
+––––––––––––––––––––––––––––––––––––––––––––––––––
+
+    # UNFINISHED
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+*/
+
 .control-button {
     color: white;
     background-color: black;
@@ -20,24 +28,7 @@
     cursor: not-allowed;
 }
 
-.control-button:disabled:hover {
-    background-color: #999;
-    cursor: not-allowed;
-}
-
 .control-button:active {
-    background-color: #333;
-    cursor: pointer;
-}
-
-.control-button:focus {
-    outline: none;
-}
-
-.control-button:disabled:focus {
-    outline: none;
-}
-
-.control-button:active:focus {
-    outline: none;
+    background-color: #666;
+    transform: translateY(4px);
 }
