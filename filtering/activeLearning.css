@@ -1,0 +1,43 @@
+.control-button {
+    color: white;
+    background-color: black;
+    border: none;
+    font-size: 20px;
+    font-weight: bold;
+    border-radius: 5px;
+    padding: 10px;
+    margin: 10px;
+    transition: 0.5s ease-in-out; 
+}
+
+.control-button:hover {
+    background-color: #333;
+    cursor: pointer;
+}
+
+.control-button:disabled {
+    background-color: #999;
+    cursor: not-allowed;
+}
+
+.control-button:disabled:hover {
+    background-color: #999;
+    cursor: not-allowed;
+}
+
+.control-button:active {
+    background-color: #333;
+    cursor: pointer;
+}
+
+.control-button:focus {
+    outline: none;
+}
+
+.control-button:disabled:focus {
+    outline: none;
+}
+
+.control-button:active:focus {
+    outline: none;
+}

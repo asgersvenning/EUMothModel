@@ -30,6 +30,8 @@ model = torch.hub.load('ultralytics/yolov5', 'custom', path=f'models/{model_weig
 import torchvision
 from torchvision.io import read_image
 
+import random
+
 ## Hyperparameters
 skip = 0 # Number of batches to skip (used to resume script from a specific batch)
 batch_size = 4 # Batch size for chunked loading of images
@@ -90,6 +92,31 @@ class HDF5Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         if isinstance(index, slice):
+            return self.tensors[index], [self.class_to_idx[i] for i in self.classes[index]]
+        elif isinstance(index, np.ndarray) or isinstance(index, torch.Tensor) or isinstance(index, list):
+            if isinstance(index, torch.Tensor):
+                index = index.numpy()
+            if isinstance(index, list):
+                types = set([type(i) for i in index])
+                if len(types) > 1:
+                    raise TypeError(f'`index` must be a list of a single type, not {types}')
+                single_type = types.pop()
+                if not single_type in [int, bool]:
+                    raise TypeError(f'`index` must be a list of integers or booleans, not {single_type}')
+                index = np.array(index)
+            if len(index) == 0:
+                raise IndexError("Empty index")
+            if not index.dtype == np.int64 and not index.dtype == np.bool_:
+                print(f'Warning: Converting index from {index.dtype} to int64 for indexing HDF5 dataset!')
+                index = index.astype(np.int64)
+            if index.dtype == np.bool_:
+                if len(index) != self.length:
+                    raise IndexError(f'`index` must be a boolean array of length {self.length}, not {len(index)}')
+                index = np.where(index)[0]
+            if (index.max() > self.length):
+                raise IndexError(f'`index` out of range: {index.max()} > {self.length}')
+            if (index.min() < 0):
+                raise IndexError(f'`index` out of range: {index.min()} < 0')
             return self.tensors[index], [self.class_to_idx[i] for i in self.classes[index]]
         else:
             return self.tensors[index], self.class_to_idx[self.classes[index]]
@@ -258,7 +285,14 @@ def non_max_suppression(
     return output
 
 # Initialize your app
-app = dash.Dash(__name__)
+style_sheet = [
+    # This would work on a local machine, but I need it to work through an SSH tunnel
+    # os.path.join(os.path.dirname(__file__), 'activeLearning.css')
+    # This works through an SSH tunnel
+    
+]
+
+app = dash.Dash(__name__, external_stylesheets=style_sheet)
 app.config.suppress_callback_exceptions = True
 
 # Define the app state
@@ -350,6 +384,17 @@ def update_store(n, existing_data, figure):
 
     return n
 
+# This callback is used to test the responsiveness of the app. It will print the number of times the test button has been clicked.
+@app.callback(
+    Output('test-store', 'data'), 
+    [Input('test-button', 'n_clicks')], 
+    [State('store', 'data'), 
+     State('graph', 'figure')]
+)
+def test_responsiveness(n, existing_data, figure):
+    print(f'Test button clicked {n} times')
+    return n
+
 # Define the app layout
 app.layout = html.Div([
     dcc.Graph(
@@ -359,14 +404,34 @@ app.layout = html.Div([
             'modeBarButtonsToRemove': ['zoom2d', 'zoomIn2d', 'zoomOut2d', 'pan2d', 'autoScale2d', 'resetScale2d', 'toImage']
         }
     ),
-    html.Button('Next', id='next-button'),
+    html.Div(
+        id='Controls', 
+        children=[
+            html.Button('Next', id='next-button', className='control-button'),
+            html.Button('Test', id='test-button', className='control-button')
+        ],
+        style={
+            'display': 'flex', 
+            'justify-content': 'center',
+            'align-items': 'center',
+            'margin-top': '10px',
+            'margin-bottom': '10px',
+            'margin-left': 'auto',
+            'margin-right': 'auto',
+            'width': '100%',
+            'height': '50px'
+        }
+    ),
     html.Div(id='next-dummy', style={'display': 'none'}, n_clicks=0),
+    dcc.Store(id='test-store'),
     dcc.Store(id='store')
 ])
 
 if __name__ == "__main__":
     
     dataset = HDF5Dataset("datasets/rebalanced75_without_larvae.h5", "images", "species")
+
+    length = len(dataset)
 
     dataloader = torch.utils.data.DataLoader(
         dataset, 
@@ -396,15 +461,19 @@ if __name__ == "__main__":
         print(f'Attempting to process batch {batch} of {n_batches}')
         if batch >= n_batches:
             break
-        i = list(range(batch * batch_size + skip, (batch + 1) * batch_size + skip))
-        i = [j for j in i if j not in processed_indices]
+        # Sample `batch_size` indices from the dataset
+        i = random.sample(range(length), batch_size)
+        i = np.array(i)
+        i.sort()
+        # Skip indices that have already been processed
+        i = i[~np.isin(i, processed_indices)]
         if len(i) == 0:
             n_batches += 1
             print("skipping batch")
             continue
         print(i)
-        indices += i
-        input, labels = dataset[i[0]:i[-1] + 1]
+        indices += list(i)
+        input, labels = dataset[i]
         assert len(input.shape) == 4, f"Input shape is {input.shape}, should be (n, c, h, w)"
         input = input.to(device, torch.float32)
         input = torch.nn.functional.interpolate(input, (1280, 1280), mode="bilinear", align_corners=True, antialias=True)
@@ -497,13 +566,13 @@ if __name__ == "__main__":
     log = open("datasets/fine_tuning.log", "a")
     # Loop over all processed indices (corresponding to images in the HDF5 dataset) and save the images and bounding boxes to disk
     for i, (ind, boxs) in tqdm(enumerate(zip(indices, corrected_boxes)), total=len(indices), desc="Creating fine tuning dataset", unit="images", leave=False):
+        # Get the split for the current index/image
+        split = indices_type[i]
+
         # Load image from HDF5 dataset using the index
         img = dataset[ind][0].numpy().transpose(1, 2, 0)
         # Save image to disk
         Image.fromarray(img).save(f"datasets/fine_tuning/images/{split}/{ind}.jpg")
-
-        # Get the split for the current index/image
-        split = indices_type[i]
 
         # Create label file for the current image
         with open(f"datasets/fine_tuning/labels/{split}/{ind}.txt", "w") as f:
@@ -531,9 +600,9 @@ if __name__ == "__main__":
         
     # Create YAML file for fine tuning (unnecessarily overrides the file if it already exists, in case the script is run multiple times, but it doesn't matter)
     with open("datasets/fine_tuning.yaml", "w") as f:
-        f.write("train: dataset/fine_tuning/images/train\n")
-        f.write("val: dataset/fine_tuning/images/valid\n")
-        f.write("test: dataset/fine_tuning/images/test\n")
+        f.write("train: datasets/fine_tuning/images/train\n")
+        f.write("val: datasets/fine_tuning/images/valid\n")
+        f.write("test: datasets/fine_tuning/images/test\n")
         f.write("nc: 2\n")
         f.write("names: ['salient_moth', 'non_salient_moth']\n")
         
