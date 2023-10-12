@@ -289,7 +289,7 @@ style_sheet = [
     # This would work on a local machine, but I need it to work through an SSH tunnel
     # os.path.join(os.path.dirname(__file__), 'activeLearning.css')
     # This works through an SSH tunnel
-    'https://codepen.io/chriddyp/pen/bWLwgP.css'
+    'https://raw.githubusercontent.com/asgersvenning/EUMothModel/main/filtering/activeLearning.css'
 ]
 
 app = dash.Dash(__name__, external_stylesheets=style_sheet)
