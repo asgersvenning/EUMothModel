@@ -6,10 +6,45 @@ from random import shuffle
 from .config import get_implicit_mount_config
 
 class ImplicitMount:
+    """
+    This is a low-level wrapper of LFTP, which provides a pythonic interface for executing LFTP commands and reading the output.
+    It provides a robust and efficient backend for communicating with a remote storage server using the SFTP protocol, using a persistent LFTP shell handled in the background by a subprocess.
+    It is designed to be used as a base class for higher-level wrappers, such as the IOHandler class, or as a standalone class for users familiar with LFTP.
+
+    TODO: This class relies on a proper SSH setup on your machine (and the remote server) for passwordless SFTP. 
+    Thoroughly test this on a fresh install, and add instructions, and the possibility for automatic setup, for setting up passwordless SFTP and SSH keys, as well as proper error handling for when this is not set up correctly.
+
+    Args:
+        user (str): The username to use for connecting to the remote directory.
+        remote (str): The remote server to connect to.
+        TODO: port (int): The port to use for connecting to the remote directory.
+        TODO: other important arguments to pass to the LFTP shell.
+        TODO: password (?): How to handle passwords? (currently assumes passwordless SFTP)
+        verbose (bool): If True, print the commands executed by the class.
+
+    Attributes:
+        Shouldn't be used unless for debugging or advanced use cases.
+
+    Functions:
+        format_options(): Format a dictionary of options into a string of command line arguments.
+        execute_command(): Execute a command on the LFTP shell.
+        mount(): Mount the remote directory.
+        unmount(): Unmount the remote directory.
+        pget(): Download a single file from the remote directory using multiple connections.
+        put(): Upload a single file to the remote directory.
+        ls(): List the contents of a directory (on the remote). OBS: In contrast to the other LFTP commands, this function has a lot of additional functionality, such as recursive listing and caching.
+        lls(): Locally list the contents of a directory.
+        cd(): Change the current directory (on the remote).
+        pwd(): Get the current directory (on the remote).
+        lcd(): Change the current directory (locally).
+        lpwd(): Get the current directory (locally).
+        mirror(): Download a directory from the remote.
+    """
+
     time_stamp_pattern = re.compile(r"^\s*(\S+\s+){8}") # This is used to strip the timestamp from the output of the lftp shell
     END_OF_OUTPUT = '# LFTP_END_OF_OUTPUT_IDENTIFIER {uuid} #'  # This is used to signal the end of output when reading from stdout
 
-    def __init__(self, user: str= None, remote: str=None, strict: bool=False, verbose: bool=False):
+    def __init__(self, user: str= None, remote: str=None, verbose: bool=False):
         # Default argument configuration and type checking
         self.default_config = get_implicit_mount_config()
         if user is None:
@@ -20,8 +55,6 @@ class ImplicitMount:
             raise TypeError("Expected str, got {}".format(type(user)))
         if not isinstance(remote, str):
             raise TypeError("Expected str, got {}".format(type(remote)))
-        if not isinstance(strict, bool):
-            raise TypeError("Expected bool, got {}".format(type(strict)))
         if not isinstance(verbose, bool):
             raise TypeError("Expected bool, got {}".format(type(verbose)))
         
@@ -29,13 +62,12 @@ class ImplicitMount:
         self.user = user
         self.password = "" # Assume we use passwordless lftp (authentication is handled by ssh keys, not sftp)
         self.remote = remote
-        self.strict = strict
         self.lftp_shell = None
         self.verbose = verbose
 
         self.stdout_queue = Queue()
         self.stderr_queue = Queue()
-        self.lock = threading.Lock()
+        self.lock = threading.Lock() 
 
     @staticmethod
     def format_options(**kwargs) -> str:
@@ -427,6 +459,28 @@ class ImplicitMount:
         return list(new_files)
 
 class IOHandler(ImplicitMount):
+    """
+    This is a high-level wrapper for the ImplicitMount class, which provides human-friendly methods for downloading files from a remote directory without the need to have technical knowledge on how to use LFTP.
+
+    Args:
+        local_dir (str): The local directory to use for downloading files. If None, a temporary directory will be used (suggested, unless truly necessary).
+        user_confirmation (bool): If True, the user will be asked for confirmation before deleting files. (strongly suggested for debugging and testing)
+        clean (bool): If True, the local directory will be cleaned after the context manager is exited. (suggested, if not it may lead to rapid exhaustion of disk space)
+        **kwargs: Keyword arguments to pass to the ImplicitMount constructor.
+
+    Attributes:
+        Shouldn't be used unless for debugging or advanced use cases.
+
+    Functions:
+        iter(): Create a RemotePathIterator object for the given remote path.
+        download(): Download the given remote path to the given local destination.
+        multi_download(): Download the given remote paths to the given local destinations.
+        get_file_index(): Get a list of files in the current directory.
+        cache_file_index(): Cache the file index for the current directory.
+        store_last(): TODO: NOT IMPLEMENTED! Move the last downloaded file or directory to the given destination.
+        clean(): Clean the local directory.
+        clean_last(): Clean the last downloaded file or directory.
+    """
     def __init__(self, local_dir: Union[str, None]=None, user_confirmation: bool=False, clean: Union[bool, None]=None, **kwargs):
         super().__init__(**kwargs)
         if local_dir is None:
@@ -480,6 +534,10 @@ class IOHandler(ImplicitMount):
         # this function is more flexible than mirror (works for files from different directories) and much faster than executing multiple pget commands
         if not isinstance(remote_path, str) and len(remote_path) > 1:
             return self.multi_download(remote_path, local_destination, **kwargs)
+        if len(remote_path) == 1:
+            remote_path = remote_path[0]
+            if not isinstance(remote_path, str):
+                raise TypeError("Expected str, got {}".format(type(remote_path)))
         
         if local_destination is None:
             local_destination = self.lpwd()
@@ -590,6 +648,7 @@ class IOHandler(ImplicitMount):
         self.cache["file_index"] = self.get_file_index(skip, nmax, override)
 
     def store_last(self, dst: str):
+        raise NotImplementedError("This function is not implemented yet.")
         # TODO: This function should really be split into two; 
         # 1) Handling the self.last_download/self.last_type variables
         # 2) Moving files/directories
@@ -633,7 +692,22 @@ class IOHandler(ImplicitMount):
                 print("Aborted")
                 return
         print("Cleaning up...")
-        shutil.rmtree(self.lpwd())
+        for path in os.listdir(self.lpwd()):
+            if os.path.isfile(path):
+                os.remove(path)
+        try:
+            shutil.rmtree(self.lpwd())
+        except Exception as e:
+            print("Error while cleaning local backend directory!")
+            files_in_dir = os.listdir(self.lpwd())
+            if files_in_dir:
+                n_files = len(files_in_dir)
+                print(f"{n_files} files in local directory ({self.lpwd()}):")
+                if n_files > 5:
+                    print("\t" + "\n\t".join(files_in_dir[:5]) + "\n\t...")
+                else:
+                    print("\t" + "\n\t".join(files_in_dir))
+            raise e
 
     def clean_last(self):
         if self.last_download is None:
@@ -674,6 +748,28 @@ class IOHandler(ImplicitMount):
             warnings.warn("Last download was not in original local directory. Not cleaning.")
 
 class RemotePathIterator:
+    """
+    This function provides a high-level buffered iterator for downloading files from a remote directory.
+    All heavy computation is done in a separate thread, to avoid blocking the main thread unnecessarily.
+
+    Args:
+        io_handler (IOHandler): A backend object of class "IOHandler" to use for downloading files.
+        batch_size (int): The number of files to download in each batch. Larger batches are more efficient, but may cause memory issues.
+        batch_parallel (int): The number of files to download in parallel in each batch. Larger values may be more efficient, but can cause excessive loads on the remote server.
+        max_queued_batches (int): The batches are processed sequentially from a queue, which is filled on request. This parameter specifies the maximum number of batches in the queue. Larger values can ensure a stable streaming rate, but may require more files to be stored locally.
+        n_local_files (int): The number of files to store locally. OBS: This MUST be larger than batch_size * max_queued_batches (I suggest twice that), otherwise files may be deleted before they are consumed. 
+        clear_local (bool): If True, the local directory will be cleared after the iterator is stopped.
+        **kwargs: Keyword arguments to pass to the IOHandler.get_file_index() function.
+
+    Attributes:
+        Shouldn't be used unless for debugging or advanced use cases.
+
+    Functions:
+        shuffle(): Shuffle the remote paths.
+        subset(indices: List[int]): Subset the remote paths.
+        split(proportion: Union[float, None]=None, indices: Union[List[List[int]], None]=None): Split the remote paths into multiple iterators, that share the same backend. These CANNOT be used in parallel. TODO: Can they be used concurrently?
+        download_files(): Download files in batches.
+    """
     def __init__(self, io_handler: "IOHandler", batch_size: int=64, batch_parallel: int=10, max_queued_batches: int=3, n_local_files: int=2*3*64, clear_local: bool=False, **kwargs):
         self.io_handler = io_handler
         if "file_index" not in self.io_handler.cache:
@@ -770,7 +866,12 @@ class RemotePathIterator:
                 time.sleep(0.2)  # Wait until a batch has been consumed
 
             batch = self.remote_paths[i:i + self.batch_size]
-            local_paths = self.io_handler.download(batch, n = self.batch_parallel)
+            try:
+                local_paths = self.io_handler.download(batch, n = self.batch_parallel)
+            except Exception as e:
+                print(f"Failed to download batch {i} - {i + self.batch_size}: {e}")
+                print("Skipping batch...")
+                continue
             for local_path, remote_path in zip(local_paths, batch):
                 self.download_queue.put((local_path, remote_path))
                 
@@ -785,7 +886,7 @@ class RemotePathIterator:
     def __iter__(self) -> "RemotePathIterator":
         # Force reset state
         self.not_cleaned = True
-        self.__del__()
+        self.__del__(force=True)
         self.idx = 0
 
         # Prepare state for iteration
@@ -814,7 +915,8 @@ class RemotePathIterator:
             try:
                 os.remove(self.delete_queue.get())
             except Exception as e:
-                warnings.warn(f"Failed to remove file: {e}")
+                if self.io_handler.verbose:
+                    warnings.warn(f"Failed to remove file: {e}")
 
         # Get next item from queue or raise error if queue is empty
         try:
@@ -840,23 +942,56 @@ class RemotePathIterator:
         # Return next item (local path, remote path => can be parsed to get the class label)
         return next_item
 
-    def __del__(self) -> None:
-        if self.not_cleaned:
+    def __del__(self, force=False) -> None:
+        if self.not_cleaned or force:
             # Force the iterator to stop if it is not already stopped
             self.stop_requested = True
             # Wait for the download thread to finish
             if self.download_thread is not None:
-                self.download_thread.join()
+                self.download_thread.join(timeout=1)
                 self.download_thread = None
             # Clean up the temporary directory
             while not self.download_queue.empty():
                 try:
                     os.remove(self.download_queue.get())
                 except Exception as e:
-                    warnings.warn(f"Failed to remove file: {e}")
+                    if self.io_handler.verbose:
+                        warnings.warn(f"Failed to remove file: {e}")
             if self.clear_local:
                 while not self.delete_queue.empty():
                     try:
                         os.remove(self.delete_queue.get())
                     except Exception as e:
-                        warnings.warn(f"Failed to remove file: {e}")
+                        if self.io_handler.verbose:
+                            warnings.warn(f"Failed to remove file: {e}")
+            else:
+                with self.delete_queue.mutex:
+                    self.delete_queue.queue.clear()
+            # Remove any remaining files in the temporary directory
+            for file in os.listdir(self.temp_dir):
+                if "folder_index.txt" in file:
+                    continue
+                try:
+                    os.remove(file)
+                except:
+                    pass
+
+            ## TODO: DOUBLE CHECK - THIS SHOULD NOT BE NECESSARY
+            # Check if the download thread is still running
+            if self.download_thread is not None:
+                warnings.warn("Download thread is still running. This should not happen.")
+                self.stop_requested = True
+                self.download_thread.join(timeout=1)
+                self.download_thread = None
+            # Check if the download queue is empty
+            if not self.download_queue.empty():
+                warnings.warn("Download queue is not empty. This should not happen.")
+                with self.download_queue.mutex:
+                    self.download_queue.queue.clear()
+            # Check if the delete queue is empty
+            if not self.delete_queue.empty() and self.clear_local:
+                warnings.warn("Delete queue is not empty. This should not happen.")
+                with self.download_queue.mutex:
+                    self.download_queue.queue.clear()
+        else:
+            print("Already cleaned up")

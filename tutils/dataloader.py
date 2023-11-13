@@ -41,7 +41,7 @@ import warnings
 from typing import Iterator, List, Tuple, Union
 
 class RemotePathDataset(IterableDataset):
-    def __init__(self, remote_path_iterator : "RemotePathIterator", prefetch: int=64, transform=None, target_transform=None, device: Union["torch.device", None]=None, dtype: Union[torch.dtype, None]=None, return_remote_path: bool=False, return_local_path: bool=False, verbose: bool=False):
+    def __init__(self, remote_path_iterator : "RemotePathIterator", prefetch: int=64, transform=None, target_transform=None, device: Union["torch.device", None]=None, dtype: Union[torch.dtype, None]=None, hierarchical: bool=False, return_remote_path: bool=False, return_local_path: bool=False, verbose: bool=False):
         # Check if remote_path_iterator is of type RemotePathIterator
         if not isinstance(remote_path_iterator, RemotePathIterator):
             raise ValueError("Argument remote_path_iterator must be of type RemotePathIterator.")
@@ -58,10 +58,22 @@ class RemotePathDataset(IterableDataset):
         
         ## PyTorch specific parameters 
         # Get the classes and their indices
-        self.classes = sorted(list(set([path.split('/')[-2] for path in remote_path_iterator.remote_paths])))
-        self.n_classes = len(self.classes)
-        self.class_to_idx = {self.classes[i]: i for i in range(len(self.classes))}
-        self.idx_to_class = {i: self.classes[i] for i in range(len(self.classes))}
+        if not hierarchical:
+            self.classes = sorted(list(set([path.split('/')[-2] for path in remote_path_iterator.remote_paths])))
+            self.n_classes = len(self.classes)
+            self.class_to_idx = {self.classes[i]: i for i in range(len(self.classes))}
+            self.idx_to_class = {i: self.classes[i] for i in range(len(self.classes))}
+        else:
+            self.classes = [[],[],[]]
+            self.n_classes = [0,0,0]
+            self.class_to_idx = [{}, {}, {}]
+            self.idx_to_class = [{}, {}, {}]
+            for level in range(3):
+                self.classes[level] = sorted(list(set([path.split('/')[-2-level] for path in remote_path_iterator.remote_paths])))
+                self.n_classes[level] = len(self.classes[level])
+                self.class_to_idx[level] = {self.classes[level][i]: i for i in range(len(self.classes[level]))}
+                self.idx_to_class[level] = {i: self.classes[level][i] for i in range(len(self.classes[level]))}
+        self.hierarchical = hierarchical
 
         # Set the transforms
         self.transform = transform
@@ -90,6 +102,7 @@ class RemotePathDataset(IterableDataset):
         # Initialize the worker threads
         self.consumer_threads = []
         self.consumers = 0
+        self.stop_consumer_threads = True
         
         # Set the buffer filling parameters (Watermark Buffering)
         self.buffer_minfill, self.buffer_maxfill = 0.4, 0.6
@@ -97,6 +110,29 @@ class RemotePathDataset(IterableDataset):
         # Initialize the buffers
         self.buffer = Queue(maxsize=prefetch)  # Tune maxsize as needed
         self.processed_buffer = Queue(maxsize=prefetch)  # Tune maxsize as needed
+
+    @property
+    def class_handles(self):
+        return {
+            'classes': self.classes,
+            'n_classes': self.n_classes,
+            'class_to_idx': self.class_to_idx,
+            'idx_to_class': self.idx_to_class,
+            'hierarchical': self.hierarchical
+        }
+    
+    @class_handles.setter
+    def class_handles(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("Argument value must be a dictionary.")
+        if value["hierarchical"]:
+            assert isinstance(value['classes'], list), ValueError("Argument value['classes'] must be a list.")
+        else:
+            assert not isinstance(value['classes'], list), ValueError("Argument value['classes'] must not be a list.")
+        self.classes = value['classes']
+        self.n_classes = value['n_classes']
+        self.class_to_idx = value['class_to_idx']
+        self.idx_to_class = value['idx_to_class']
 
     def _shuffle(self):
         if not self.shuffle:
@@ -107,6 +143,7 @@ class RemotePathDataset(IterableDataset):
 
     def _shutdown_and_reset(self):
         # Handle shutdown logic (Should probably be moved to a dedicated reset function, that is called on StopIteration instead or perhaps in __iter__)
+        self.stop_consumer_threads = True # Signal the consumer threads to stop
         for i, consumer in enumerate(self.consumer_threads):
             if consumer is None:
                 continue
@@ -122,7 +159,7 @@ class RemotePathDataset(IterableDataset):
         self.thread_initiated = False # Reset the thread initiated flag
         self.buffer.queue.clear() # Clear the buffer
         self.processed_buffer.queue.clear() # Clear the processed buffer
-        self.remote_path_iterator.__del__()  # Close the remote_path_iterator and clean the temporary directory
+        self.remote_path_iterator.__del__(force=True)  # Close the remote_path_iterator and clean the temporary directory
         assert self.buffer.qsize() == 0, RuntimeError("Buffer not empty after iterator end.")
         assert self.processed_buffer.qsize() == 0, RuntimeError("Processed buffer not empty after iterator end.")
 
@@ -189,14 +226,14 @@ class RemotePathDataset(IterableDataset):
             while qsize < (self.num_workers * 2):
                 time.sleep(0.05 / self.num_workers)
                 qsize = self.buffer.qsize()
-                if not self.producer_thread.is_alive():
+                if self.producer_thread is None or not self.producer_thread.is_alive():
                     break
             # Get the next item from the buffer
             item = self.buffer.get()
             if self.verbose:
                 print("Consumer thread got item")
             # Check if the buffer is empty, signaling the end of the iterator
-            if item is None:
+            if item is None or self.stop_consumer_threads:
                 break  # Close the thread
 
             # Preprocess the item (e.g. read image, apply transforms, etc.) and put it in the processed buffer
@@ -215,7 +252,8 @@ class RemotePathDataset(IterableDataset):
         # If it has, reset the dataloader state and close all threads
         # (Only one iteration is allowed per dataloader instance)
         if self.thread_initiated: 
-            self._shutdown_and_reset()
+            warnings.warn("Iterator called, but buffer filling thread is still active. Resetting the dataloader state.")
+        self._shutdown_and_reset()
 
         # If shuffle is set to True, shuffle the remote_path_iterator
         if self.shuffle:
@@ -229,6 +267,8 @@ class RemotePathDataset(IterableDataset):
             self.num_workers = 1
         if self.num_workers < 1:
             raise ValueError("Number of workers must be greater than 0.")
+
+        self.stop_consumer_threads = False
 
         # Start consumer threads for processing
         for _ in range(self.num_workers):
@@ -247,6 +287,14 @@ class RemotePathDataset(IterableDataset):
         if processed_item is None:
             self._shutdown_and_reset()
             raise StopIteration
+        
+        # Restart crashed consumer threads
+        for thread in self.consumer_threads:
+            if not thread.is_alive():
+                self.consumer_threads.remove(thread)
+                new_consumer_thread = Thread(target=self._process_buffer)
+                new_consumer_thread.daemon = True
+                self.consumer_threads.append(new_consumer_thread)
 
         # Otherwise, return the processed item
         return processed_item
@@ -264,8 +312,8 @@ class RemotePathDataset(IterableDataset):
             return None
         try:
             image = read_image(local_path, mode=ImageReadMode.RGB)
-        except:
-            print(f"Error reading image {remote_path}.")
+        except Exception as e:
+            print(f"Error reading image {remote_path} ({e}).")
             return None
         # Remove the alpha channel if present
         if image.shape[0] == 4:
@@ -286,7 +334,11 @@ class RemotePathDataset(IterableDataset):
         family, genus, species = remote_path.split('/')[-4:-1]
         # TODO: Use the family and genus information (or add a "species only" flag)
         # Transform the species name to the label index
-        label = self.class_to_idx[species]
+        if not self.hierarchical:
+            label = self.class_to_idx[species]
+        else:
+            label = [self.class_to_idx[level][cls] for level, cls in enumerate([species, genus, family])]
+
         # Apply label transforms
         if self.target_transform:
             label = self.target_transform(label)

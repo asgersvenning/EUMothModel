@@ -3,6 +3,7 @@ config.yaml
 __pycache__
 test
 logs
+tensorboard_logs
 datasets
 *.png
 *.pt

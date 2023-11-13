@@ -24,8 +24,16 @@ from multiprocessing import Process, Manager
 
 import torch
 
-model_weights = "insectGBIF-1280m6.pt"
-model = torch.hub.load('ultralytics/yolov5', 'custom', path=f'models/{model_weights}', force_reload=False)
+# Import YOLOv5 helper functions
+sys.path.append('/home/ucloud/EUMothModel')
+from tutils.yolo_helpers import image_preprocessing, box_iou, xywh2xyxy, non_max_suppression
+
+model_weights = "insect_iter6-1280m7.pt"
+model = torch.hub.load(
+    'ultralytics/yolov5', 
+    'custom', 
+    path=f'models/{model_weights}',
+    force_reload=False)
 
 import torchvision
 from torchvision.io import read_image
@@ -34,9 +42,13 @@ import random
 
 ## Hyperparameters
 skip = 0 # Number of batches to skip (used to resume script from a specific batch)
-batch_size = 4 # Batch size for chunked loading of images
+batch_size = 8 # Batch size for chunked loading of images
 n_batches = 1 # Number of batches to load
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+dtype=torch.float16
+real_class_index = 0 # The real class index of the species to fine-tune on (6 for the initial model; insectGBIF-1280m6.pt)
+inference_size = 640 # The size of the images to run inference on (1280 for the initial model; insectGBIF-1280m6.pt)
+
 
 # HDF5 Dataset Class
 class HDF5Tensors:
@@ -125,164 +137,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.length
 
-# Helper functions
-def image_preprocessing(image: "torch.Tensor") -> "torch.Tensor":
-    """
-    This function preprocesses images for inference with the yolov5m6 model.
-
-    args:
-        image (torch.Tensor): Image tensor to preprocess. Should be of shape (3, H, W).
-    
-    returns:
-        torch.Tensor: Preprocessed image tensor. Will be of shape (3, 1280, 1280).
-    """
-    image = image.unsqueeze(0)
-
-    # Resize image
-    image = torch.nn.functional.interpolate(image, (1280, 1280), mode="bilinear", align_corners=False, antialias=True)
-
-    return image.squeeze(0)
-
-def box_iou(box1, box2, eps=1e-7):
-    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
-    """
-    Return intersection-over-union (Jaccard index) of boxes.
-    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
-    Arguments:
-        box1 (Tensor[N, 4])
-        box2 (Tensor[M, 4])
-    Returns:
-        iou (Tensor[N, M]): the NxM matrix containing the pairwise
-            IoU values for every element in boxes1 and boxes2
-    """
-
-    # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
-    (a1, a2), (b1, b2) = box1.unsqueeze(1).chunk(2, 2), box2.unsqueeze(0).chunk(2, 2)
-    inter = (torch.min(a2, b2) - torch.max(a1, b1)).clamp(0).prod(2)
-
-    # IoU = inter / (area1 + area2 - inter)
-    return inter / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - inter + eps)
-
-def xywh2xyxy(x):
-    # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-    y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
-    y[..., 1] = x[..., 1] - x[..., 3] / 2  # top left y
-    y[..., 2] = x[..., 0] + x[..., 2] / 2  # bottom right x
-    y[..., 3] = x[..., 1] + x[..., 3] / 2  # bottom right y
-    return y
-
-def non_max_suppression(
-        prediction,
-        conf_thres=0.25,
-        iou_thres=0.45,
-        classes=None,
-        agnostic=False,
-        multi_label=False,
-        labels=(),
-        max_det=300,
-        nm=0,  # number of masks
-):
-    """Non-Maximum Suppression (NMS) on inference results to reject overlapping detections
-
-    Returns:
-         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
-    """
-
-    # Checks
-    assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'
-    assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
-    if isinstance(prediction, (list, tuple)):  # YOLOv5 model in validation model, output = (inference_out, loss_out)
-        prediction = prediction[0]  # select only inference output
-
-    device = prediction.device
-    mps = 'mps' in device.type  # Apple MPS
-    if mps:  # MPS not fully supported yet, convert tensors to CPU before NMS
-        prediction = prediction.cpu()
-    bs = prediction.shape[0]  # batch size
-    nc = prediction.shape[2] - nm - 5  # number of classes
-    xc = prediction[..., 4] > conf_thres  # candidates
-
-    # Settings
-    # min_wh = 2  # (pixels) minimum box width and height
-    max_wh = 7680  # (pixels) maximum box width and height
-    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
-    time_limit = 0.5 + 0.05 * bs  # seconds to quit after
-    redundant = True  # require redundant detections
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-    merge = False  # use merge-NMS
-
-    t = time.time()
-    mi = 5 + nc  # mask start index
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
-    for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
-        x = x[xc[xi]]  # confidence
-
-        # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]):
-            lb = labels[xi]
-            v = torch.zeros((len(lb), nc + nm + 5), device=x.device)
-            v[:, :4] = lb[:, 1:5]  # box
-            v[:, 4] = 1.0  # conf
-            v[range(len(lb)), lb[:, 0].long() + 5] = 1.0  # cls
-            x = torch.cat((x, v), 0)
-
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
-
-        # Compute conf
-        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
-
-        # Box/Mask
-        box = xywh2xyxy(x[:, :4])  # center_x, center_y, width, height) to (x1, y1, x2, y2)
-        mask = x[:, mi:]  # zero columns if no masks
-
-        # Detections matrix nx6 (xyxy, conf, cls)
-        if multi_label:
-            i, j = (x[:, 5:mi] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, 5 + j, None], j[:, None].float(), mask[i]), 1)
-        else:  # best class only
-            conf, j = x[:, 5:mi].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
-
-        # Filter by class
-        if classes is not None:
-            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Apply finite constraint
-        # if not torch.isfinite(x).all():
-        #     x = x[torch.isfinite(x).all(1)]
-
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
-            continue
-        x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
-
-        # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        i = i[:max_det]  # limit detections
-        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-            weights = iou * scores[None]  # box weights
-            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-            if redundant:
-                i = i[iou.sum(1) > 1]  # require redundancy
-
-        output[xi] = x[i]
-        if mps:
-            output[xi] = output[xi].to(device)
-        if (time.time() - t) > time_limit:
-            print(f'WARNING NMS time limit {time_limit:.3f}s exceeded')
-            break  # time limit exceeded
-
-    return output
+### Dash app
 
 # Initialize your app
 styles = [
@@ -298,7 +153,6 @@ styles = [
 scripts = [
     #<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
     {
-    #<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
         'src': 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js',
         'integrity': 'sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL',
         'crossorigin': 'anonymous'
@@ -307,7 +161,7 @@ scripts = [
 
 
 app = dash.Dash(__name__, external_stylesheets=styles, external_scripts=scripts)
-app.config.suppress_callback_exceptions = True
+app.config.suppress_callback_exceptions = False
 
 # Define the app state
 manager = Manager()
@@ -345,10 +199,10 @@ def update_figure(n0, n, relayoutData, existing):
     if len(initial_boxes) > 0:
         for box in initial_boxes:
             x1, y1, x2, y2 = box[:4]
-            x1 *= width/1280
-            x2 *= width/1280
-            y1 *= height/1280
-            y2 *= height/1280
+            x1 *= width/inference_size
+            x2 *= width/inference_size
+            y1 *= height/inference_size
+            y2 *= height/inference_size
             if x1 == x2 or y1 == y2:
                 continue
             shapes.append(
@@ -383,10 +237,10 @@ def update_store(n, existing_data, figure):
         new_list = []
         for shape_data in figure['layout']['shapes']:
             x0, y0, x1, y1 = shape_data['x0'], shape_data['y0'], shape_data['x1'], shape_data['y1']
-            x0 *= 1280/width
-            x1 *= 1280/width
-            y0 *= 1280/height
-            y1 *= 1280/height
+            x0 *= inference_size/width
+            x1 *= inference_size/width
+            y0 *= inference_size/height
+            y1 *= inference_size/height
             new_box = [x0, y0, x1, y1]
             print(f'New box: {new_box}')
             new_list.append(new_box)
@@ -455,7 +309,7 @@ if __name__ == "__main__":
         pin_memory=False
     )
 
-    model = model.to(device)
+    model = model.to(device,dtype=dtype)
 
     # Test the model
     model.eval()
@@ -489,12 +343,16 @@ if __name__ == "__main__":
         indices += list(i)
         input, labels = dataset[i]
         assert len(input.shape) == 4, f"Input shape is {input.shape}, should be (n, c, h, w)"
-        input = input.to(device, torch.float32)
-        input = torch.nn.functional.interpolate(input, (1280, 1280), mode="bilinear", align_corners=True, antialias=True)
-        pred = model(input / 255).clone()
+        input = input.to(device, dtype=torch.float32)
+        input = torch.nn.functional.interpolate(input, (inference_size, inference_size), mode="bilinear", align_corners=True, antialias=True).to(dtype=dtype)
+        pred = model(input / 255, augment=True)
+        if isinstance(pred, tuple) or isinstance(pred, list):
+            pred = [i for i in pred if i is not None]
+            pred = torch.cat(pred, dim=1) # TODO: Why does this even work?
+        pred = pred.clone().to(torch.float32)
         # Filter prediction == 5 by setting confidence to 0 for bounding boxes with argmax class 5
-        pred[..., 4][torch.argmax(pred[..., 5:], dim=-1) != 6] = -1
-        pred = non_max_suppression(pred, conf_thres=0, iou_thres=0.5, max_det=5) # list of detections, on (n,6) tensor per image [xyxy, conf, cls]
+        pred[..., 4][torch.argmax(pred[..., 5:], dim=-1) != real_class_index] = -1
+        pred = non_max_suppression(pred, conf_thres=0.5, iou_thres=0, max_det=5) # list of detections, on (n,6) tensor per image [xyxy, conf, cls]
 
         predictions += pred
 
@@ -510,6 +368,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error on selecting best bounding box from {i}")
             raise e
+        
+    del predictions, pred, input, labels, batch, model, dataloader
+    torch.cuda.empty_cache()
 
     boxes = torch.stack(best_bbox).numpy()
 
@@ -601,8 +462,8 @@ if __name__ == "__main__":
             # with the salient box having class 0 and all other boxes having class 1
             for j, box in enumerate(boxs):
                 x1, y1, x2, y2 = box
-                x1, y1, x2, y2 = x1 / 1280, y1 / 1280, x2 / 1280, y2 / 1280
-                x, y, w, h = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+                x1, y1, x2, y2 = x1 / inference_size, y1 / inference_size, x2 / inference_size, y2 / inference_size
+                x, y, w, h = (x1 + x2) / 2, (y1 + y2) / 2, abs(x2 - x1), abs(y2 - y1)
                 cls = 0 if j == salient_box else 1
                 f.write(f"{cls} {x} {y} {w} {h}\n")
         
@@ -614,9 +475,15 @@ if __name__ == "__main__":
         
     # Create YAML file for fine tuning (unnecessarily overrides the file if it already exists, in case the script is run multiple times, but it doesn't matter)
     with open("datasets/fine_tuning.yaml", "w") as f:
-        f.write("train: datasets/fine_tuning/images/train\n")
-        f.write("val: datasets/fine_tuning/images/valid\n")
-        f.write("test: datasets/fine_tuning/images/test\n")
+        f.write("Fine-tuning dataset YAML file\n")
+        f.write("\n")
+        f.write("# Content:\n")
+        f.write("path: ~/datasets/fine_tuning\n")
+        f.write("train: images/train\n")
+        f.write("val: images/valid\n")
+        f.write("test: images/test\n")
+        f.write("\n")
+        f.write("# Classes:\n")
         f.write("nc: 2\n")
         f.write("names: ['salient_moth', 'non_salient_moth']\n")
         
