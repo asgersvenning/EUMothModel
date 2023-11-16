@@ -5,6 +5,8 @@ test
 logs
 tensorboard_logs
 datasets
+models
+sahi
 *.png
 *.pt
 *.h5

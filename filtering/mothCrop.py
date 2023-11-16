@@ -1,24 +1,18 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
 from torchvision.io import read_image
-from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import numpy as np
 from math import sqrt, ceil
-import sys
+import os
 from tqdm import tqdm
 
 # Import YOLOv5 helper functions
-sys.path.append('/home/ucloud/EUMothModel')
-from tutils.yolo_helpers import image_preprocessing, box_iou, xywh2xyxy, non_max_suppression
-from tutils.implicit_mount import *
-from tutils.dataloader import *
+os.chdir("/home/ucloud/EUMothModel")
+from tutils.yolo_helpers import image_preprocessing, non_max_suppression
+from pyremotedata.implicit_mount import IOHandler
+from pyremotedata.dataloader import RemotePathDataset, RemotePathIterator, CustomDataLoader
 
 model_weights = "insect_iter7-1280m6.pt"
 model = torch.hub.load(
@@ -39,7 +33,7 @@ inference_size = 640 # The size of the images to run inference on (1280 for the 
 # ERDA data transfer setup
 backend = IOHandler(verbose = False, clean=True)
 backend.start()
-backend.cd("AMI_GBIF_Pretraining_Data/rebalanced75_without_larvae")
+backend.cd("rebalanced75_without_larvae")
 backend.cache_file_index(skip=skip)
 
 # Dataset and dataloader setup

@@ -14,11 +14,14 @@ from math import sqrt, ceil
 import sys, shutil, os, time
 from tqdm import tqdm
 
-# Import YOLOv5 helper functions
-sys.path.append('/home/ucloud/EUMothModel')
+import pickle
+
+os.chdir("/home/ucloud/EUMothModel")
 from tutils.class_handling import *
-from tutils.implicit_mount import *
-from tutils.dataloader import *
+from pyremotedata.implicit_mount import *
+from pyremotedata.dataloader import *
+
+from copy import deepcopy
 
 from tensorboardX import SummaryWriter
 
@@ -161,7 +164,7 @@ num_features = [k for k in [j for j in [i for i in model.children()][0].children
 num_classes = datasets[0].n_classes
 
 class HierarchicalClassifier(nn.Module):
-    def __init__(self, num_features, num_classes, masks):
+    def __init__(self, num_features, num_classes, masks, class_handles=None):
         super(HierarchicalClassifier, self).__init__()
         self.silu = nn.SiLU()
         self.dropout1 = nn.Dropout(0.2)
@@ -179,8 +182,12 @@ class HierarchicalClassifier(nn.Module):
         self.leaf_logits = nn.Linear(512, num_classes[0], device=device, dtype=dtype)
         self.bn5 = nn.BatchNorm1d(num_classes[0], device=device, dtype=dtype)
         self.masks = masks.copy()
+        self.class_handles = deepcopy(class_handles)
+        self.return_embeddings = False
         
     def forward(self, x):
+        if self.return_embeddings:
+            embeddings = x.clone()
         x = self.dropout1(x)
         x = self.bn1(x)
         x = self.linear1(x)
@@ -201,7 +208,30 @@ class HierarchicalClassifier(nn.Module):
         y0 = F.log_softmax(y, dim = 1)
         y1 = F.log_softmax(torch.logsumexp(y0.unsqueeze(2) + self.masks[0].T, dim = 1), dim = 1)
         y2 = F.log_softmax(torch.logsumexp(y1.unsqueeze(2) + self.masks[1].T, dim = 1), dim = 1)
-        return [y0, y1, y2]
+        if self.return_embeddings:
+            return [y0, y1, y2], embeddings
+        else:
+            return [y0, y1, y2]
+        
+    def toggle_embeddings(self, value=None):
+        orig_value = self.return_embeddings
+        if value:
+            assert isinstance(value, bool), ValueError("Value must be a boolean")
+            self.return_embeddings = value
+        else:
+            self.return_embeddings = not self.return_embeddings
+        return orig_value
+    
+    def save_state(self, path):
+        torch.save(self.state_dict(), path)
+        pickle.dump(self.masks, open(path + ".masks", "wb"))
+        pickle.dump(self.class_handles, open(path + ".class_handles", "wb"))
+
+    def load_state(self, path):
+        self.load_state_dict(torch.load(path))
+        self.masks = pickle.load(open(path + ".masks", "rb"))
+        self.class_handles = pickle.load(open(path + ".class_handles", "rb"))
+
 
 
 model.to(device=device, dtype=dtype)

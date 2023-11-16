@@ -4,12 +4,12 @@
 # The script will also create a log file with the indices and splits for the fine-tuning dataset. This log file can be used to resume the script from a specific
 # batch in case the script is interrupted, or if the user wants to correct bounding boxes in smaller batches.
 
-import os, sys
+import os
 
 # Import other modules
 from tqdm import tqdm
 import numpy as np
-import h5py, hdf5plugin
+import h5py
 import time
 
 from PIL import Image
@@ -25,8 +25,8 @@ from multiprocessing import Process, Manager
 import torch
 
 # Import YOLOv5 helper functions
-sys.path.append('/home/ucloud/EUMothModel')
-from tutils.yolo_helpers import image_preprocessing, box_iou, xywh2xyxy, non_max_suppression
+os.chdir("/home/ucloud/EUMothModel")
+from tutils.yolo_helpers import non_max_suppression
 
 model_weights = "insect_iter6-1280m7.pt"
 model = torch.hub.load(
@@ -34,9 +34,6 @@ model = torch.hub.load(
     'custom', 
     path=f'models/{model_weights}',
     force_reload=False)
-
-import torchvision
-from torchvision.io import read_image
 
 import random
 
