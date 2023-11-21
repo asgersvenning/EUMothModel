@@ -4,13 +4,13 @@ import numpy as np
 
 from collections import Counter
 
-def class_counting(paths, class_handles):
+def class_counting(paths, class_handles, class_parser = lambda x: x.split("/")[2::-1]):
     """
     Count the number of each class in the labels
     """
     counts = [Counter() for _ in class_handles["n_classes"]]
     for path in paths:
-        components = path.split("/")[2::-1]
+        components = class_parser(path)
         for ctype, class_str in enumerate(components):
             counts[ctype][class_handles["class_to_idx"][ctype][class_str]] += 1
 
