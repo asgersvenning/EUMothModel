@@ -10,3 +10,5 @@ sahi
 *.png
 *.pt
 *.h5
+*.gz
+*-ubyte

@@ -50,6 +50,17 @@ def parse_state_file(path):
             state["masks"][mi][state["masks"][mi] >= -1] = 0
     return state
 
+def save_state_file(state, path):
+    # Package the state files into a zip file
+    with zipfile.ZipFile(path, "w") as zip_file:
+        for key, value in state.items():
+            if key in ["state_dict", "masks"]:
+                with zip_file.open(key + ".pt", "w") as f:
+                    torch.save(value, f)
+            else:
+                zip_file.writestr(key + ".pkl", pickle.dumps(value))
+
+
 def package_old_files(weights_path : Union[str, None] = None, class_handles_path : Union[str, None] = None, masks_path : Union[str, None] = None, output_path : str = None) -> None:
     """
     This is a helper function to package the old files into a state file.
@@ -81,20 +92,25 @@ def package_old_files(weights_path : Union[str, None] = None, class_handles_path
         raise ValueError("masks_path must be a string or None")
     # Load the state files
     state = {}
+
+    # Helper function to load the files (either .pt or .pkl)
+    def load_file(path):
+        file_type = os.path.splitext(path)[1]
+        if not file_type in [".pt", ".pkl"]:
+            raise ValueError(f"File type {file_type} is not supported.")
+        if file_type == ".pt":
+            return torch.load(path, map_location="cpu")
+        elif file_type == ".pkl":
+            return pickle.load(open(path, "rb"))
+    
     if weights_path is not None:
-        state["state_dict"] = torch.load(weights_path, map_location="cpu")
+        state["state_dict"] = load_file(weights_path)
     if class_handles_path is not None:
-        state["class_handles"] = pickle.load(open(class_handles_path, "rb"))
+        state["class_handles"] = load_file(class_handles_path)
     if masks_path is not None:
-        state["masks"] = torch.load(masks_path, map_location="cpu")
-    # Package the state files into a zip file
-    with zipfile.ZipFile(output_path, "w") as zip_file:
-        for key, value in state.items():
-            if key in ["state_dict", "masks"]:
-                with zip_file.open(key + ".pt", "w") as f:
-                    torch.save(value, f)
-            else:
-                zip_file.writestr(key + ".pkl", pickle.dumps(value))
+        state["masks"] = load_file(masks_path)
+    
+    save_state_file(state, output_path)
 
 class HierachicalPrediction(list):
     def __init__(self, predictions):
@@ -144,7 +160,7 @@ class HierarchicalClassifier(nn.Module):
         self.dropout4 : nn.Dropout = nn.Dropout(0.1)
         self.leaf_logits : nn.Linear = nn.Linear(512, num_classes[0], device=device, dtype=dtype)
         self.bn5 : nn.BatchNorm1d = nn.BatchNorm1d(num_classes[0], device=device, dtype=dtype)
-        self.masks : List[torch.Tensor] = [mask.to(device=device, dtype=dtype).requires_grad_(False) for mask in deepcopy(masks)]
+        self.masks : List[torch.Tensor] = [mask.to(device=device, dtype=dtype).requires_grad_(False) * 10 for mask in deepcopy(masks)]
         self.return_embeddings : bool = False
         # self.masks = torch.jit.Attribute([mask.to(device=device, dtype=dtype).requires_grad_(False) for mask in deepcopy(masks)], List[torch.Tensor])
         # self.return_embeddings = torch.jit.Attribute(False, bool)
@@ -154,36 +170,35 @@ class HierarchicalClassifier(nn.Module):
     # @torch.compile(fullgraph=True, mode="max-autotune")
     # def forward(self, x) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
     def forward(self, x) -> List[torch.Tensor]:
-        # if self.return_embeddings:
-        #     embeddings = x.clone()
+        if self.return_embeddings:
+            embeddings = x.clone()
         x = self.dropout1(x)
-        x = self.bn1(x)
+        # x = self.bn1(x)
         x = self.linear1(x) # Layer 1
-        x = self.bn2(x)
+        # x = self.bn2(x)
         x = self.silu(x)
         x = self.dropout2(x)
         x = self.linear2(x) # Layer 2
-        x = self.bn3(x)
+        # x = self.bn3(x)
         x = self.silu(x)
         x = self.dropout3(x)
         x = self.linear3(x) # Layer 3
-        x = self.bn4(x)
+        # x = self.bn4(x)
         x = self.silu(x)
         x = self.dropout4(x)
         x = self.leaf_logits(x) # Leaf logits (Layer 4)
         x = self.silu(x)
-        x = self.bn5(x)
+        # x = self.bn5(x)
         # Compute the normalized log probabilities for the leaf nodes (level 0)
         y0 = F.log_softmax(x, dim = 1)
         ys = [y0]
         # Propagate the probabilities up the hierarchy using the masks
         for mask in self.masks:
-            ys.append(F.log_softmax(torch.logsumexp(ys[-1].unsqueeze(2) + mask.T, dim = 1), dim = 1))
-        return ys
-        # if self.return_embeddings:
-        #     return ys, embeddings
-        # else:
-        #     return ys
+            ys.append(torch.logsumexp(ys[-1].unsqueeze(2) + mask.T, dim = 1))
+        if self.return_embeddings:
+            return ys, embeddings
+        else:
+            return ys
         
     def to(self, device=None, dtype=None):
         if device is not None:

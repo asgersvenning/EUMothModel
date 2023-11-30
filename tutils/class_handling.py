@@ -4,11 +4,11 @@ import numpy as np
 
 from collections import Counter
 
-def class_counting(paths, class_handles, class_parser = lambda x: x.split("/")[2::-1]):
+def class_counting(paths, class_handles, class_parser = lambda x: x.split("/")[-2:-5:-1]):
     """
     Count the number of each class in the labels
     """
-    counts = [Counter() for _ in class_handles["n_classes"]]
+    counts = [Counter(range(l)) for l in class_handles["n_classes"]]
     for path in paths:
         components = class_parser(path)
         for ctype, class_str in enumerate(components):
@@ -19,7 +19,7 @@ def class_counting(paths, class_handles, class_parser = lambda x: x.split("/")[2
 
     return counts
 
-def create_hierarchy(paths, class_handles):
+def create_hierarchy(paths, class_handles, class_parser = lambda x: x.split("/")[-2:-5:-1]):
     """
     Creates a hierarchy from the paths and class handles.
     The hierarchy is constructed based on the nodes found in the dataset. 
@@ -41,7 +41,7 @@ def create_hierarchy(paths, class_handles):
     # Iterate over the paths (labels are embedded as subdirectories in the path)
     for path in paths:
         # Split the path into its components and reverse the order (This assumes the structure of the subdirectories) TODO: Make this more general
-        components = path.split("/")[2::-1]
+        components = class_parser(path)
         # Convert the class strings to indices
         indices = [class_handles["class_to_idx"][ctype][class_str] for ctype, class_str in enumerate(components)] 
         
@@ -121,6 +121,7 @@ def create_random_P(n_classes, **kwargs):
     """
     Create a random P matrix for testing with the given number of classes at each level.
     """
+    raise NotImplementedError("This function is not implemented properly yet.")
     P = [None] * len(n_classes)
     P[0] = torch.rand(n_classes[0], **kwargs)  # Create a random P matrix for the leaf level
     P[0] = F.log_softmax(P[0], dim=-1)  # Normalize along class dimension
