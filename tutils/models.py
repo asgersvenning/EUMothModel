@@ -22,7 +22,7 @@ _UNSUPPORTED_MODELS = [
     'vit_b_16', 'vit_b_32', 'vit_h_14', 'vit_l_16', 'vit_l_32'
     ]
 
-def parse_state_file(path):
+def parse_state_file(path, device=torch.device("cpu"), dtype=torch.float32):
     """
     This a helper function to parse the state file of a HierarchicalClassifier.
     The state file is a zip file which contains an optional state_dict (weights - torch .pt file), a class_handles file (pickle), and a masks file (pickle).
@@ -46,6 +46,7 @@ def parse_state_file(path):
         state["masks"] = torch.load(zip_file.open("masks.pt"), map_location="cpu")
         # Ensure numeric stability of the masks
         for mi in range(len(state["masks"])):
+            state["masks"][mi] = state["masks"][mi].to(device=device, dtype=dtype)
             state["masks"][mi][state["masks"][mi] < -1] = -100
             state["masks"][mi][state["masks"][mi] >= -1] = 0
     return state
